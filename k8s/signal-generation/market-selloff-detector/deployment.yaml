@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: market-selloff-detector
+  namespace: crypto-trading
+  labels:
+    app: market-selloff-detector
+    component: signal-generation
+    service-type: market-analysis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: market-selloff-detector
+  template:
+    metadata:
+      labels:
+        app: market-selloff-detector
+        component: signal-generation
+        service-type: market-analysis
+    spec:
+      containers:
+      - name: market-selloff-detector
+        image: megabob70/crypto-market-selloff-detector:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8028
+          name: http
+        env:
+        - name: DB_HOST
+          value: "host.docker.internal"
+        - name: DB_USER
+          value: "news_collector"
+        - name: DB_PASSWORD
+          value: "99Rules!"
+        - name: DB_NAME
+          value: "crypto_prices"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8028
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8028
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8028
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 12
+      restartPolicy: Always

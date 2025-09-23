@@ -1,0 +1,231 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-gen-portfolio
+  namespace: crypto-trading
+  labels:
+    app: signal-gen-portfolio
+    service: portfolio
+spec:
+  selector:
+    app: signal-gen-portfolio
+  ports:
+  - name: http
+    port: 8054
+    targetPort: 8054
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-gen-portfolio
+  namespace: crypto-trading
+  labels:
+    app: signal-gen-portfolio
+    service: portfolio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-gen-portfolio
+  template:
+    metadata:
+      labels:
+        app: signal-gen-portfolio
+        service: portfolio
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8054"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: portfolio
+        image: crypto-signal-gen-portfolio:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8054
+          name: http
+        envFrom:
+        - configMapRef:
+            name: signal-gen-config
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8054
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8054
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: logs
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-gen-risk-mgmt
+  namespace: crypto-trading
+  labels:
+    app: signal-gen-risk-mgmt
+    service: risk-mgmt
+spec:
+  selector:
+    app: signal-gen-risk-mgmt
+  ports:
+  - name: http
+    port: 8055
+    targetPort: 8055
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-gen-risk-mgmt
+  namespace: crypto-trading
+  labels:
+    app: signal-gen-risk-mgmt
+    service: risk-mgmt
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-gen-risk-mgmt
+  template:
+    metadata:
+      labels:
+        app: signal-gen-risk-mgmt
+        service: risk-mgmt
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8055"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: risk-mgmt
+        image: crypto-signal-gen-risk-mgmt:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8055
+          name: http
+        envFrom:
+        - configMapRef:
+            name: signal-gen-config
+        - secretRef:
+            name: signal-gen-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8055
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8055
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: logs
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-gen-analytics
+  namespace: crypto-trading
+  labels:
+    app: signal-gen-analytics
+    service: analytics
+spec:
+  selector:
+    app: signal-gen-analytics
+  ports:
+  - name: http
+    port: 8056
+    targetPort: 8056
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-gen-analytics
+  namespace: crypto-trading
+  labels:
+    app: signal-gen-analytics
+    service: analytics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-gen-analytics
+  template:
+    metadata:
+      labels:
+        app: signal-gen-analytics
+        service: analytics
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8056"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: analytics
+        image: crypto-signal-gen-analytics:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8056
+          name: http
+        envFrom:
+        - configMapRef:
+            name: signal-gen-config
+        - secretRef:
+            name: signal-gen-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8056
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8056
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: logs
+        emptyDir: {}

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: social-intelligence-monitor
+  namespace: crypto-trading
+  labels:
+    app: social-intelligence-monitor
+    component: signal-generation
+    service-type: social-data-collection
+spec:
+  selector:
+    app: social-intelligence-monitor
+  ports:
+  - name: http
+    port: 8032
+    targetPort: 8032
+    protocol: TCP
+  type: ClusterIP

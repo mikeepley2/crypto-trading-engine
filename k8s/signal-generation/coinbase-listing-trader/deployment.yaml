@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coinbase-listing-trader
+  namespace: crypto-trading
+  labels:
+    app: coinbase-listing-trader
+    component: signal-generation
+    service-type: listing-detection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coinbase-listing-trader
+  template:
+    metadata:
+      labels:
+        app: coinbase-listing-trader
+        component: signal-generation
+        service-type: listing-detection
+    spec:
+      containers:
+      - name: coinbase-listing-trader
+        image: aitest-coinbase-listing-trader:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8033
+          name: http
+        env:
+        - name: DB_HOST
+          value: "192.168.230.163"
+        - name: DB_USER
+          value: "news_collector"
+        - name: DB_PASSWORD
+          value: "99Rules!"
+        - name: DB_NAME
+          value: "crypto_transactions"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8033
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8033
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8033
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 12
+      restartPolicy: Always

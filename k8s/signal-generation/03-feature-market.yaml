@@ -1,0 +1,155 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-gen-feature-engine
+  namespace: crypto-trading
+  labels:
+    app: signal-gen-feature-engine
+    service: feature-engine
+spec:
+  selector:
+    app: signal-gen-feature-engine
+  ports:
+  - name: http
+    port: 8052
+    targetPort: 8052
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-gen-feature-engine
+  namespace: crypto-trading
+  labels:
+    app: signal-gen-feature-engine
+    service: feature-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-gen-feature-engine
+  template:
+    metadata:
+      labels:
+        app: signal-gen-feature-engine
+        service: feature-engine
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8052"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: feature-engine
+        image: crypto-signal-gen-feature-engine:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8052
+          name: http
+        envFrom:
+        - configMapRef:
+            name: signal-gen-config
+        - secretRef:
+            name: signal-gen-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8052
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8052
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: logs
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-gen-market-context
+  namespace: crypto-trading
+  labels:
+    app: signal-gen-market-context
+    service: market-context
+spec:
+  selector:
+    app: signal-gen-market-context
+  ports:
+  - name: http
+    port: 8053
+    targetPort: 8053
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-gen-market-context
+  namespace: crypto-trading
+  labels:
+    app: signal-gen-market-context
+    service: market-context
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-gen-market-context
+  template:
+    metadata:
+      labels:
+        app: signal-gen-market-context
+        service: market-context
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8053"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: market-context
+        image: crypto-signal-gen-market-context:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8053
+          name: http
+        envFrom:
+        - configMapRef:
+            name: signal-gen-config
+        - secretRef:
+            name: signal-gen-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8053
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8053
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: logs
+        emptyDir: {}

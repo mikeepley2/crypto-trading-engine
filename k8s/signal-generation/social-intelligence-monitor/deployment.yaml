@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: social-intelligence-monitor
+  namespace: crypto-trading
+  labels:
+    app: social-intelligence-monitor
+    component: signal-generation
+    service-type: social-data-collection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: social-intelligence-monitor
+  template:
+    metadata:
+      labels:
+        app: social-intelligence-monitor
+        component: signal-generation
+        service-type: social-data-collection
+    spec:
+      containers:
+      - name: social-intelligence-monitor
+        image: megabob70/crypto-social-intelligence-monitor:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8032
+          name: http
+        env:
+        - name: MYSQL_HOST
+          value: "host.docker.internal"
+        - name: MYSQL_USER
+          value: "news_collector"
+        - name: MYSQL_PASSWORD
+          value: "99Rules!"
+        - name: MYSQL_DATABASE
+          value: "crypto_prices"
+        - name: SERVICE_PORT
+          value: "8032"
+        - name: SERVICE_NAME
+          value: "social-intelligence-monitor"
+        - name: ENVIRONMENT
+          value: "kubernetes"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8032
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8032
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      restartPolicy: Always
