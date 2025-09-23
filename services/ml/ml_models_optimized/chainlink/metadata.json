@@ -1,0 +1,48 @@
+{
+  "coin": "chainlink",
+  "features": [
+    "confidence_std_1h",
+    "sentiment_range_1h",
+    "sentiment_momentum_1h",
+    "sentiment_extreme_negative_1h",
+    "confidence_std_4h",
+    "sentiment_range_4h",
+    "sentiment_momentum_4h",
+    "sentiment_extreme_negative_4h",
+    "confidence_std_24h",
+    "sentiment_range_24h",
+    "sentiment_momentum_24h",
+    "sentiment_extreme_negative_24h",
+    "sentiment_score_count_7d",
+    "confidence_std_7d",
+    "sentiment_range_7d",
+    "sentiment_momentum_7d",
+    "sentiment_extreme_negative_7d",
+    "sentiment_vs_market_1h",
+    "open",
+    "high",
+    "low",
+    "volume_ma_24h",
+    "price_category_1h",
+    "price_category_4h",
+    "price_category_24h"
+  ],
+  "training_date": "2025-07-02T03:01:51.719683+00:00",
+  "train_samples": 520,
+  "test_samples": 130,
+  "optimization_level": "high_performance",
+  "models": {
+    "RandomForest": {
+      "accuracy": 0.823076923076923,
+      "roc_auc": 0.9233136094674557
+    },
+    "XGBoost": {
+      "accuracy": 0.8307692307692308,
+      "roc_auc": 0.9320710059171597
+    },
+    "LogisticRegression": {
+      "accuracy": 0.8461538461538461,
+      "roc_auc": 0.9353846153846153
+    }
+  }
+}

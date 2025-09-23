@@ -1,0 +1,253 @@
+{
+  "total_tests": 35,
+  "passed_tests": 10,
+  "failed_tests": 25,
+  "success_rate": 28.57142857142857,
+  "execution_time_seconds": 23.14203906059265,
+  "timestamp": "2025-08-09T14:11:03.301442",
+  "test_results": {
+    "Core Services Health": {
+      "risk_health": {
+        "status": "passed",
+        "response": {
+          "status": "healthy",
+          "service": "risk",
+          "metrics": {
+            "counters": {
+              "risk.trades_checked": 1
+            },
+            "timings": {}
+          }
+        },
+        "response_time_ms": 100
+      },
+      "signals_health": {
+        "status": "passed",
+        "response": {
+          "status": "healthy",
+          "service": "signals",
+          "metrics": {
+            "counters": {
+              "signals.errors": 5
+            },
+            "timings": {}
+          }
+        },
+        "response_time_ms": 100
+      },
+      "portfolio_health": {
+        "status": "passed",
+        "response": {
+          "status": "healthy",
+          "service": "portfolio_manager",
+          "metrics": {
+            "counters": {},
+            "timings": {}
+          }
+        },
+        "response_time_ms": 100
+      },
+      "recommendations_health": {
+        "status": "passed",
+        "response": {
+          "status": "healthy",
+          "metrics": {
+            "counters": {},
+            "timings": {}
+          }
+        },
+        "response_time_ms": 100
+      },
+      "mock_trading_health": {
+        "status": "passed",
+        "response": {
+          "status": "healthy",
+          "service": "fixed_mock_trading_engine",
+          "metrics": {
+            "counters": {},
+            "timings": {
+              "portfolio.fetch": {
+                "count": 4,
+                "avg_ms": 49.76367950439453,
+                "p95_ms": 72.95012474060059
+              }
+            }
+          }
+        },
+        "response_time_ms": 100
+      },
+      "live_trading_health": {
+        "status": "passed",
+        "response": {
+          "status": "healthy",
+          "service": "live_trading_engine"
+        },
+        "response_time_ms": 100
+      },
+      "analytics_health": {
+        "status": "failed",
+        "error": "Cannot connect to host localhost:8027 ssl:default [The remote computer refused the network connection]",
+        "response_time_ms": 5000
+      },
+      "ml_integration_health": {
+        "status": "failed",
+        "error": "Cannot connect to host localhost:8024 ssl:default [The remote computer refused the network connection]",
+        "response_time_ms": 5000
+      },
+      "llm_enhanced_health": {
+        "status": "failed",
+        "error": "Cannot connect to host localhost:8030 ssl:default [The remote computer refused the network connection]",
+        "response_time_ms": 5000
+      }
+    },
+    "Advanced Order Management": {
+      "position_sizing": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "risk_management": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "bracket_orders": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      }
+    },
+    "LLM Analysis Service": {
+      "market_context": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "llm_analysis_structure": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "llm_provider": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      }
+    },
+    "ML Integration": {
+      "ml_signal_structure": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "ensemble_creation": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "ml_service_api": {
+        "status": "failed",
+        "error": "Cannot connect to host localhost:8024 ssl:default [The remote computer refused the network connection]"
+      }
+    },
+    "Automated Strategies": {
+      "dca_strategy": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "grid_strategy": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "arbitrage_strategy": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      }
+    },
+    "Multi-Exchange Arbitrage": {
+      "price_aggregator": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "arbitrage_detection": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "portfolio_balancer": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      }
+    },
+    "Portfolio Analytics": {
+      "analytics_api": {
+        "status": "failed",
+        "error": "Cannot connect to host localhost:8027 ssl:default [The remote computer refused the network connection]"
+      },
+      "performance_metrics": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "portfolio_comparison": {
+        "status": "failed",
+        "error": "Cannot connect to host localhost:8027 ssl:default [The remote computer refused the network connection]"
+      }
+    },
+    "LLM-Enhanced Trading": {
+      "llm_engine_api": {
+        "status": "failed",
+        "error": "Cannot connect to host localhost:8030 ssl:default [The remote computer refused the network connection]"
+      },
+      "trading_decision_structure": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      },
+      "market_regime": {
+        "status": "failed",
+        "error": "No module named 'backend'"
+      }
+    },
+    "End-to-End Workflow": {
+      "end_to_end_workflow": {
+        "status": "passed",
+        "completed_steps": 6,
+        "workflow_steps": [
+          "ML signal generation",
+          "LLM market analysis",
+          "Ensemble decision making",
+          "Risk assessment",
+          "Order creation",
+          "Trading engine execution"
+        ]
+      },
+      "service_integration": {
+        "status": "passed",
+        "working_integrations": 4,
+        "integration_types": [
+          "ml_to_llm",
+          "llm_to_trading",
+          "risk_to_portfolio",
+          "analytics_integration"
+        ]
+      }
+    },
+    "Performance Benchmarks": {
+      "api_response_times": {
+        "status": "passed",
+        "avg_response_time_ms": 1669.486363728841,
+        "response_times": {
+          "risk": 4.175424575805664,
+          "signals": 3.734111785888672,
+          "portfolio": 3.780364990234375,
+          "recommendations": 5.710363388061523,
+          "mock_trading": 4.081249237060547,
+          "live_trading": 3.8957595825195312,
+          "analytics": 5000,
+          "ml_integration": 5000,
+          "llm_enhanced": 5000
+        }
+      },
+      "concurrent_handling": {
+        "status": "passed",
+        "concurrent_requests": 30,
+        "successful_responses": 30,
+        "execution_time_seconds": 0.05752205848693848
+      },
+      "resource_usage": {
+        "status": "skipped",
+        "note": "psutil not available - install for resource monitoring"
+      }
+    }
+  }
+}

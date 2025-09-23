@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt requirements.txt
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the advanced portfolio rebalancer and dependencies
+COPY advanced_portfolio_rebalancer.py .
+COPY signal_coherence_manager.py .
+
+# Add health check script
+RUN echo '#!/bin/bash\ncurl -f http://localhost:8035/health' > /healthcheck.sh && \
+    chmod +x /healthcheck.sh
+
+# Expose port
+EXPOSE 8035
+
+# Run the advanced rebalancer service
+CMD ["python", "advanced_portfolio_rebalancer.py"]

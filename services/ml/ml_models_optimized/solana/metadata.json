@@ -1,0 +1,48 @@
+{
+  "coin": "solana",
+  "features": [
+    "sentiment_score_std_1h",
+    "sentiment_score_count_1h",
+    "confidence_mean_1h",
+    "confidence_std_1h",
+    "sentiment_score_std_4h",
+    "sentiment_score_count_4h",
+    "confidence_mean_4h",
+    "confidence_std_4h",
+    "sentiment_score_std_24h",
+    "sentiment_score_max_24h",
+    "sentiment_score_count_24h",
+    "confidence_mean_24h",
+    "confidence_std_24h",
+    "sentiment_score_std_7d",
+    "sentiment_score_max_7d",
+    "sentiment_score_count_7d",
+    "confidence_mean_7d",
+    "confidence_std_7d",
+    "open",
+    "high",
+    "low",
+    "volume_ma_24h",
+    "price_category_1h",
+    "price_category_4h",
+    "price_category_24h"
+  ],
+  "training_date": "2025-07-02T02:25:53.568359+00:00",
+  "train_samples": 520,
+  "test_samples": 130,
+  "optimization_level": "high_performance",
+  "models": {
+    "RandomForest": {
+      "accuracy": 0.8384615384615385,
+      "roc_auc": 0.9394155381325731
+    },
+    "XGBoost": {
+      "accuracy": 0.8153846153846154,
+      "roc_auc": 0.9284865763839392
+    },
+    "LogisticRegression": {
+      "accuracy": 0.8769230769230769,
+      "roc_auc": 0.9558089807555239
+    }
+  }
+}

@@ -1,0 +1,70 @@
+# Core dependencies for async operations and data handling
+aiohttp>=3.8.0
+numpy>=1.21.0
+pandas>=1.5.0
+
+# Web framework for API endpoints
+fastapi>=0.104.0
+uvicorn>=0.24.0
+
+# Database connectivity
+mysql-connector-python>=8.0.32
+PyMySQL>=1.0.2
+
+# HTTP requests and API interactions
+requests>=2.28.0
+urllib3>=1.26.0
+
+# Twitter API integration
+tweepy>=4.14.0
+
+# Data analysis and processing
+scipy>=1.9.0
+scikit-learn>=1.1.0
+
+# JSON and configuration handling
+python-dotenv>=0.19.0
+
+# Date and time utilities
+python-dateutil>=2.8.0
+pytz>=2022.1
+
+# Logging and monitoring
+structlog>=22.1.0
+
+# Cryptocurrency and trading utilities
+ccxt>=2.5.0  # Cryptocurrency exchange library
+
+# Web scraping for roadmap monitoring
+beautifulsoup4>=4.11.0
+selenium>=4.5.0
+
+# Async database operations
+aiomysql>=0.1.1
+
+# Mathematical operations for risk calculations
+sympy>=1.10.0
+
+# HTTP client for better performance
+httpx>=0.24.0
+
+# Rate limiting for API calls
+ratelimit>=2.2.0
+
+# Caching for improved performance
+cachetools>=5.2.0
+
+# Configuration management
+pydantic>=1.10.0
+
+# Websocket support for real-time data
+websockets>=10.4
+
+# Development and testing
+pytest>=7.1.0
+pytest-asyncio>=0.21.0
+pytest-mock>=3.8.0
+
+# Optional: Advanced features
+# textblob>=0.17.1  # For sentiment analysis
+# transformers>=4.21.0  # For advanced NLP models

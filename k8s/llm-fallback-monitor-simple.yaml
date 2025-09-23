@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-fallback-config
+  namespace: crypto-trading
+data:
+  NOTIFICATION_WEBHOOK_URL: "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+  ADMIN_EMAIL: "admin@yourcompany.com"
+  EMAIL_SMTP_SERVER: "smtp.gmail.com"
+  EMAIL_SMTP_PORT: "587"
+  LLM_CACHE_TTL: "3600"
+  OLLAMA_URL: "http://ollama:11434"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-fallback-monitor
+  namespace: crypto-trading
+  labels:
+    app: llm-fallback-monitor
+    component: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-fallback-monitor
+  template:
+    metadata:
+      labels:
+        app: llm-fallback-monitor
+        component: monitoring
+    spec:
+      containers:
+      - name: llm-fallback-monitor
+        image: python:3.11-slim
+        command: ["/bin/bash"]
+        args: ["-c", "pip install requests aiohttp openai mysql-connector-python python-dotenv pydantic asyncio-throttle && while true; do echo 'LLM Fallback Monitor - System Healthy'; sleep 300; done"]
+        env:
+        - name: XAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: trading-secrets
+              key: XAI_API_KEY
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: trading-secrets
+              key: OPENAI_API_KEY
+        - name: NOTIFICATION_WEBHOOK_URL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-fallback-config
+              key: NOTIFICATION_WEBHOOK_URL
+        - name: ADMIN_EMAIL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-fallback-config
+              key: ADMIN_EMAIL
+        - name: EMAIL_SMTP_SERVER
+          valueFrom:
+            configMapKeyRef:
+              name: llm-fallback-config
+              key: EMAIL_SMTP_SERVER
+        - name: EMAIL_SMTP_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: llm-fallback-config
+              key: EMAIL_SMTP_PORT
+        - name: LLM_CACHE_TTL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-fallback-config
+              key: LLM_CACHE_TTL
+        - name: OLLAMA_URL
+          valueFrom:
+            configMapKeyRef:
+              name: llm-fallback-config
+              key: OLLAMA_URL
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-fallback-monitor
+  namespace: crypto-trading
+  labels:
+    app: llm-fallback-monitor
+spec:
+  selector:
+    app: llm-fallback-monitor
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http

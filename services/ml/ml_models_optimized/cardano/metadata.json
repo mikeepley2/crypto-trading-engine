@@ -1,0 +1,48 @@
+{
+  "coin": "cardano",
+  "features": [
+    "sentiment_score_std_1h",
+    "sentiment_score_min_1h",
+    "sentiment_score_count_1h",
+    "sentiment_momentum_1h",
+    "sentiment_score_std_4h",
+    "sentiment_score_min_4h",
+    "sentiment_score_count_4h",
+    "sentiment_momentum_4h",
+    "sentiment_score_std_24h",
+    "sentiment_score_min_24h",
+    "sentiment_score_count_24h",
+    "sentiment_momentum_24h",
+    "sentiment_score_std_7d",
+    "sentiment_score_min_7d",
+    "sentiment_score_count_7d",
+    "confidence_std_7d",
+    "sentiment_momentum_7d",
+    "open",
+    "high",
+    "low",
+    "volume_ma_24h",
+    "price_category_1h",
+    "strong_movement_4h",
+    "price_category_4h",
+    "price_category_24h"
+  ],
+  "training_date": "2025-07-02T02:25:57.936550+00:00",
+  "train_samples": 520,
+  "test_samples": 130,
+  "optimization_level": "high_performance",
+  "models": {
+    "RandomForest": {
+      "accuracy": 0.7769230769230769,
+      "roc_auc": 0.9173850574712644
+    },
+    "XGBoost": {
+      "accuracy": 0.8076923076923077,
+      "roc_auc": 0.9245689655172414
+    },
+    "LogisticRegression": {
+      "accuracy": 0.7769230769230769,
+      "roc_auc": 0.9216954022988506
+    }
+  }
+}

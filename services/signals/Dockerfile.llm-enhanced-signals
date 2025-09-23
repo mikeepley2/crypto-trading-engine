@@ -1,0 +1,45 @@
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    pkg-config \
+    default-libmysqlclient-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements-llm-enhanced-signals.txt requirements.txt
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the enhanced signal generator and dependencies
+COPY backend/services/trading/signals/llm_signal_assessor.py .
+COPY backend/services/trading/signals/llm_enhanced_signal_generator.py .
+COPY backend/services/trading/signals/llm_enhanced_signal_service.py .
+COPY enhanced_signal_generator.py .
+COPY signal_coherence_manager.py .
+
+# Copy any other required modules
+COPY backend/services/trading/signals/dynamic_position_manager.py .
+COPY backend/services/trading/signals/symbol_utils.py .
+
+# Expose port
+EXPOSE 8045
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8045/health || exit 1
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV ENABLE_LLM_ASSESSMENT=true
+ENV LLM_ASSESSMENT_THRESHOLD=0.4
+ENV LLM_SIGNAL_SERVICE_PORT=8045
+
+# Run the service
+CMD ["python", "llm_enhanced_signal_service.py"]

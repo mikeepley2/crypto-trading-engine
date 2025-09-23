@@ -1,0 +1,48 @@
+{
+  "coin": "ethereum",
+  "features": [
+    "sentiment_score_std_1h",
+    "sentiment_score_max_1h",
+    "sentiment_momentum_1h",
+    "sentiment_extreme_positive_1h",
+    "sentiment_score_std_4h",
+    "sentiment_score_max_4h",
+    "sentiment_momentum_4h",
+    "sentiment_extreme_positive_4h",
+    "sentiment_score_std_24h",
+    "sentiment_score_max_24h",
+    "sentiment_momentum_24h",
+    "sentiment_extreme_positive_24h",
+    "sentiment_score_std_7d",
+    "sentiment_score_max_7d",
+    "sentiment_momentum_7d",
+    "sentiment_extreme_positive_7d",
+    "open",
+    "high",
+    "low",
+    "volume_ma_24h",
+    "price_category_1h",
+    "strong_movement_4h",
+    "price_category_4h",
+    "strong_movement_24h",
+    "price_category_24h"
+  ],
+  "training_date": "2025-07-02T03:02:58.208956+00:00",
+  "train_samples": 520,
+  "test_samples": 130,
+  "optimization_level": "high_performance",
+  "models": {
+    "RandomForest": {
+      "accuracy": 0.7769230769230769,
+      "roc_auc": 0.8745545260156806
+    },
+    "XGBoost": {
+      "accuracy": 0.7615384615384615,
+      "roc_auc": 0.8904727963886909
+    },
+    "LogisticRegression": {
+      "accuracy": 0.7615384615384615,
+      "roc_auc": 0.8669517700166309
+    }
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "coin": "tron",
+  "features": [
+    "sentiment_score_mean_1h",
+    "sentiment_score_count_1h",
+    "sentiment_range_1h",
+    "sentiment_score_mean_4h",
+    "sentiment_score_max_4h",
+    "sentiment_score_count_4h",
+    "sentiment_range_4h",
+    "sentiment_score_mean_24h",
+    "sentiment_score_max_24h",
+    "sentiment_score_count_24h",
+    "sentiment_range_24h",
+    "sentiment_score_mean_7d",
+    "sentiment_score_max_7d",
+    "sentiment_score_count_7d",
+    "sentiment_range_7d",
+    "market_sentiment_mean",
+    "market_sentiment_std",
+    "sentiment_vs_market_1h",
+    "open",
+    "high",
+    "low",
+    "price_category_1h",
+    "strong_movement_4h",
+    "price_category_4h",
+    "price_category_24h"
+  ],
+  "training_date": "2025-07-02T03:08:13.876035+00:00",
+  "train_samples": 520,
+  "test_samples": 130,
+  "optimization_level": "high_performance",
+  "models": {
+    "RandomForest": {
+      "accuracy": 0.6153846153846154,
+      "roc_auc": 0.67475
+    },
+    "XGBoost": {
+      "accuracy": 0.6230769230769231,
+      "roc_auc": 0.6727500000000001
+    },
+    "LogisticRegression": {
+      "accuracy": 0.6615384615384615,
+      "roc_auc": 0.6970000000000001
+    }
+  }
+}

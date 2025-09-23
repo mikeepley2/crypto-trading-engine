@@ -1,0 +1,66 @@
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install additional packages for signal bridge
+RUN pip install --no-cache-dir \
+    mysql-connector-python \
+    pandas \
+    numpy \
+    requests \
+    schedule \
+    fastapi \
+    uvicorn
+
+# Copy the signal to recommendation bridge and dependencies
+COPY backend/services/trading/signals/automated_signal_bridge_service.py .
+COPY backend/services/trading/signals/dynamic_position_manager.py .
+COPY backend/services/trading/signals/symbol_utils.py .
+COPY backend/services/trading/signals/simple_notification_service.py .
+COPY backend/services/trading/shared/coinbase_asset_filter.py .
+
+# Create automated runner script
+RUN echo '#!/bin/bash\n\
+echo "Automated Signal Bridge Service Started"\n\
+echo "Database Host: ${DATABASE_HOST}"\n\
+echo "Monitoring enhanced signals every ${BRIDGE_INTERVAL_SECONDS:-30} seconds"\n\
+\n\
+# Run the automated bridge service\n\
+python automated_signal_bridge_service.py' > /app/run_bridge.sh && chmod +x /app/run_bridge.sh
+
+# Create healthcheck script
+RUN echo '#!/bin/bash\n\
+# Check if the bridge service process is running\n\
+if pgrep -f "automated_signal_bridge_service.py" > /dev/null; then\n\
+    echo "Signal bridge service is running"\n\
+    exit 0\n\
+else\n\
+    echo "Signal bridge service is not running"\n\
+    exit 1\n\
+fi' > /app/healthcheck.sh && chmod +x /app/healthcheck.sh
+
+# Set user
+RUN useradd -r -s /bin/false bridger && \
+    chown -R bridger:bridger /app
+
+USER bridger
+
+# Health check
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+    CMD /app/healthcheck.sh
+
+# Run the automated bridge service
+CMD ["/app/run_bridge.sh"]

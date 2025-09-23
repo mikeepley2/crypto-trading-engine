@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install fastapi uvicorn mysql-connector-python apscheduler requests httpx
+
+# Create the backend directory structure for proper imports
+RUN mkdir -p /app/backend/services/trading
+
+# Copy the shared modules with proper structure
+COPY shared ./backend/services/trading/shared
+
+COPY recommendations/trade_recommendation_service.py .
+
+# Set Python path to include the app directory
+ENV PYTHONPATH="/app"
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8022
+
+CMD ["uvicorn", "trade_recommendation_service:app", "--host", "0.0.0.0", "--port", "8022"]

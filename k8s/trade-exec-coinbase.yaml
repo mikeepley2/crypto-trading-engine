@@ -1,0 +1,158 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trade-exec-coinbase-config
+  namespace: crypto-trading
+  labels:
+    app: trade-exec-coinbase
+    category: trade-execution
+    component: coinbase
+data:
+  # Database Configuration
+  DB_HOST: "host.docker.internal"
+  DB_USER: "news_collector"
+  DB_NAME_TRANSACTIONS: "crypto_transactions"
+  DB_NAME_PRICES: "crypto_prices"
+  
+  # Trading Mode Configuration
+  EXECUTION_MODE: "live"
+  COINBASE_API_MODE: "live"
+  TRADE_EXECUTION_ENABLED: "true"
+  
+  # Risk Management Settings
+  MAX_POSITION_SIZE_USD: "500.0"
+  MAX_DAILY_TRADES: "300"
+  MAX_DAILY_LOSS_USD: "500.0"
+  BALANCE_UTILIZATION: "0.95"
+  
+  # Duplicate Prevention Settings
+  MIN_TRADE_SIZE_USD: "25.00"  # Increased from $10 to $25 to reduce excessive micro-trades
+  ENABLE_DUPLICATE_PREVENTION: "true"
+  DUPLICATE_TRADE_WINDOW_SECONDS: "120"
+  
+  # Coinbase API Configuration  
+  COINBASE_API_KEY: "organizations/5f04b9a1-3467-4f94-bb5c-2769d89fe5d6/apiKeys/996f9a7a-3b71-46fb-9951-6fac9c186836"
+  COINBASE_BASE_URL: "https://api.coinbase.com"
+  
+  # Notification Configuration
+  ENABLE_NOTIFICATIONS: "true"
+  NOTIFICATION_SERVICE_URL: "http://notification-service.crypto-monitoring.svc.cluster.local:8038"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: trade-exec-coinbase-secrets
+  namespace: crypto-trading
+  labels:
+    app: trade-exec-coinbase
+    category: trade-execution
+    component: coinbase
+type: Opaque
+stringData:
+  DB_PASSWORD: "99Rules!"
+  COINBASE_PRIVATE_KEY: |
+    -----BEGIN EC PRIVATE KEY-----
+    MHcCAQEEIOeCWqujZ+0nNkJQwXsx9UGyNwwgWM9jV+sC35V2jOc0oAoGCCqGSM49
+    AwEHoUQDQgAEdGRWA8fDHryh4KAlovasl8eg6l/cNxbEiN/Wl9bdDPFY/ZLHexIG
+    CkppK6pngv7uGAp+RomWgF1pGsITa5Trvw==
+    -----END EC PRIVATE KEY-----
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trade-exec-coinbase
+  namespace: crypto-trading
+  labels:
+    app: trade-exec-coinbase
+    category: trade-execution
+    component: coinbase
+    version: v1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trade-exec-coinbase
+  template:
+    metadata:
+      labels:
+        app: trade-exec-coinbase
+        category: trade-execution
+        component: coinbase
+        version: v1
+    spec:
+      containers:
+      - name: trade-exec-coinbase
+        image: aitest-trade-exec-coinbase:signal-type-fix
+        imagePullPolicy: Never  # For local development
+        ports:
+        - containerPort: 8024
+          name: http
+          protocol: TCP
+        env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: trade-exec-coinbase-secrets
+              key: DB_PASSWORD
+        - name: COINBASE_PRIVATE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: trade-exec-coinbase-secrets
+              key: COINBASE_PRIVATE_KEY
+        envFrom:
+        - configMapRef:
+            name: trade-exec-coinbase-config
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8024
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8024
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: logs
+        emptyDir: {}
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trade-exec-coinbase
+  namespace: crypto-trading
+  labels:
+    app: trade-exec-coinbase
+    category: trade-execution
+    component: coinbase
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8024
+    targetPort: 8024
+    protocol: TCP
+    name: http
+  selector:
+    app: trade-exec-coinbase

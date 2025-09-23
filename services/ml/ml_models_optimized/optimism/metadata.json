@@ -1,0 +1,48 @@
+{
+  "coin": "optimism",
+  "features": [
+    "sentiment_score_min_1h",
+    "sentiment_score_count_1h",
+    "sentiment_momentum_1h",
+    "news_volume_1h",
+    "sentiment_score_min_4h",
+    "sentiment_score_count_4h",
+    "sentiment_momentum_4h",
+    "news_volume_4h",
+    "sentiment_score_min_24h",
+    "sentiment_score_count_24h",
+    "sentiment_momentum_24h",
+    "news_volume_24h",
+    "sentiment_score_min_7d",
+    "sentiment_score_count_7d",
+    "sentiment_momentum_7d",
+    "news_volume_7d",
+    "market_sentiment_mean",
+    "open",
+    "high",
+    "low",
+    "volume_ma_24h",
+    "price_category_1h",
+    "price_category_4h",
+    "strong_movement_24h",
+    "price_category_24h"
+  ],
+  "training_date": "2025-07-02T02:25:47.502410+00:00",
+  "train_samples": 520,
+  "test_samples": 130,
+  "optimization_level": "high_performance",
+  "models": {
+    "RandomForest": {
+      "accuracy": 0.8615384615384616,
+      "roc_auc": 0.9351325757575757
+    },
+    "XGBoost": {
+      "accuracy": 0.8153846153846154,
+      "roc_auc": 0.935842803030303
+    },
+    "LogisticRegression": {
+      "accuracy": 0.8846153846153846,
+      "roc_auc": 0.9602272727272727
+    }
+  }
+}

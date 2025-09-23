@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-trade-validator
+  namespace: crypto-trading
+  labels:
+    app: llm-trade-validator
+    component: validation
+    version: v1.0.0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-trade-validator
+  template:
+    metadata:
+      labels:
+        app: llm-trade-validator
+        component: validation
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8035"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: llm-trade-validator
+        image: aitest-llm-trade-validator:v2
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8035
+          name: http
+        env:
+        - name: DATABASE_HOST
+          value: "host.docker.internal"
+        - name: DATABASE_USER
+          value: "news_collector"
+        - name: DATABASE_PASSWORD
+          value: "99Rules!"
+        - name: DATABASE_NAME
+          value: "crypto_transactions"
+        - name: LLM_VALIDATION_PORT
+          value: "8035"
+        - name: MAX_DAILY_TRADES
+          value: "50"
+        - name: MAX_DAILY_LOSS_USD
+          value: "500"
+        - name: MAX_POSITION_SIZE_USD
+          value: "1000"
+        - name: OLLAMA_BASE_URL
+          value: "http://ollama.crypto-trading.svc.cluster.local:11434"
+        - name: LOG_LEVEL
+          value: "INFO"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi" 
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8035
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8035
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8035
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-trade-validator
+  namespace: crypto-trading
+  labels:
+    app: llm-trade-validator
+    component: validation
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8035"
+    prometheus.io/path: "/metrics"
+spec:
+  selector:
+    app: llm-trade-validator
+  ports:
+  - name: http
+    port: 8035
+    targetPort: 8035
+    protocol: TCP
+  type: ClusterIP

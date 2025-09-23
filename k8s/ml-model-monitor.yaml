@@ -1,0 +1,315 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-model-monitor-config
+  namespace: crypto-trading
+data:
+  monitoring_config.json: |
+    {
+      "alert_conditions": {
+        "max_fallback_signals": 10,
+        "min_model_confidence": 0.6,
+        "max_signal_frequency": 50
+      },
+      "service_endpoints": {
+        "signal_generator": "http://enhanced-signal-generator.crypto-trading.svc.cluster.local:8025/health",
+        "signal_bridge": "http://microservices-signal-bridge.crypto-trading.svc.cluster.local:8022/health",
+        "ml_engine": "http://signal-gen-ml-engine.crypto-trading.svc.cluster.local:8001/health"
+      },
+      "monitoring_interval_minutes": 5
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-model-monitor
+  namespace: crypto-trading
+  labels:
+    app: ml-model-monitor
+    component: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ml-model-monitor
+  template:
+    metadata:
+      labels:
+        app: ml-model-monitor
+        component: monitoring
+    spec:
+      containers:
+      - name: ml-model-monitor
+        image: python:3.11-slim
+        imagePullPolicy: Always
+        command: ["/bin/bash"]
+        args:
+          - -c
+          - |
+            pip install aiohttp mysql-connector-python pandas numpy
+            python /app/ml_model_monitoring.py
+        env:
+        - name: PYTHONPATH
+          value: "/app"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: monitor-script
+          mountPath: /app/ml_model_monitoring.py
+          subPath: ml_model_monitoring.py
+        - name: monitor-config
+          mountPath: /app/config
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - "import os; exit(0 if os.path.exists('/tmp/ml_model_monitor.log') else 1)"
+          initialDelaySeconds: 30
+          periodSeconds: 60
+        readinessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - "import os; exit(0 if os.path.exists('/tmp/ml_model_monitor.log') else 1)"
+          initialDelaySeconds: 10
+          periodSeconds: 30
+      volumes:
+      - name: monitor-script
+        configMap:
+          name: ml-model-monitor-script
+          defaultMode: 0755
+      - name: monitor-config
+        configMap:
+          name: ml-model-monitor-config
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-model-monitor-script
+  namespace: crypto-trading
+data:
+  ml_model_monitoring.py: |
+    #!/usr/bin/env python3
+    """
+    ML Model Monitoring Service - Kubernetes Version
+    Monitors signal generation services for ML model availability and prevents fallback mode operation
+    """
+
+    import asyncio
+    import aiohttp
+    import mysql.connector
+    import json
+    import logging
+    from datetime import datetime, timedelta
+    from typing import Dict, List, Optional
+    import os
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('/tmp/ml_model_monitor.log'),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
+
+    class MLModelMonitor:
+        def __init__(self):
+            self.db_config = {
+                'host': 'host.docker.internal',
+                'user': 'news_collector',
+                'password': '99Rules!',
+                'database': 'crypto_prices'
+            }
+            
+            # Load config from configmap
+            try:
+                with open('/app/config/monitoring_config.json', 'r') as f:
+                    config = json.load(f)
+                    self.service_endpoints = config['service_endpoints']
+                    self.alert_conditions = config['alert_conditions']
+                    self.monitoring_interval = config['monitoring_interval_minutes']
+            except Exception as e:
+                logger.warning(f"Failed to load config, using defaults: {e}")
+                # Fallback to default config
+                self.service_endpoints = {
+                    'signal_generator': 'http://enhanced-signal-generator.crypto-trading.svc.cluster.local:8025/health',
+                    'signal_bridge': 'http://microservices-signal-bridge.crypto-trading.svc.cluster.local:8022/health',
+                    'ml_engine': 'http://signal-gen-ml-engine.crypto-trading.svc.cluster.local:8001/health'
+                }
+                self.alert_conditions = {
+                    'max_fallback_signals': 10,
+                    'min_model_confidence': 0.6,
+                    'max_signal_frequency': 50,
+                }
+                self.monitoring_interval = 5
+            
+        async def check_service_health(self, session: aiohttp.ClientSession, service_name: str, endpoint: str) -> Dict:
+            """Check health status of a service"""
+            try:
+                async with session.get(endpoint, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return {
+                            'service': service_name,
+                            'status': 'healthy',
+                            'response': data,
+                            'timestamp': datetime.now()
+                        }
+                    else:
+                        return {
+                            'service': service_name,
+                            'status': 'unhealthy',
+                            'error': f'HTTP {response.status}',
+                            'timestamp': datetime.now()
+                        }
+            except Exception as e:
+                return {
+                    'service': service_name,
+                    'status': 'error',
+                    'error': str(e),
+                    'timestamp': datetime.now()
+                }
+        
+        def check_database_signals(self) -> Dict:
+            """Check recent signals in database for fallback mode indicators"""
+            try:
+                conn = mysql.connector.connect(**self.db_config)
+                cursor = conn.cursor()
+                
+                # Check for fallback signals in last hour
+                cursor.execute("""
+                    SELECT 
+                        COUNT(*) as total_signals,
+                        SUM(CASE WHEN model_version = 'fallback_signal_generator' THEN 1 ELSE 0 END) as fallback_signals,
+                        AVG(confidence) as avg_confidence,
+                        MIN(confidence) as min_confidence,
+                        MAX(confidence) as max_confidence
+                    FROM trading_signals 
+                    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                """)
+                
+                result = cursor.fetchone()
+                total_signals, fallback_signals, avg_confidence, min_confidence, max_confidence = result
+                
+                conn.close()
+                
+                return {
+                    'total_signals': total_signals or 0,
+                    'fallback_signals': fallback_signals or 0,
+                    'avg_confidence': float(avg_confidence) if avg_confidence else 0.0,
+                    'min_confidence': float(min_confidence) if min_confidence else 0.0,
+                    'max_confidence': float(max_confidence) if max_confidence else 0.0,
+                    'timestamp': datetime.now()
+                }
+                
+            except Exception as e:
+                logger.error(f"Database check failed: {e}")
+                return {
+                    'error': str(e),
+                    'timestamp': datetime.now()
+                }
+        
+        def handle_critical_alert(self, alert: Dict):
+            """Handle critical alerts by taking immediate action"""
+            if alert['type'] == 'FALLBACK_MODE_DETECTED':
+                logger.critical(f"🚨 CRITICAL: {alert['message']}")
+                
+                # Log detailed fallback mode information
+                logger.critical("🔧 IMMEDIATE ACTION REQUIRED:")
+                logger.critical("   1. Check ML model file exists in enhanced-signal-generator pod")
+                logger.critical("   2. Restart signal generator: kubectl rollout restart deployment/enhanced-signal-generator -n crypto-trading")
+                logger.critical("   3. Monitor logs: kubectl logs -n crypto-trading deployment/enhanced-signal-generator -f")
+                logger.critical("   4. Verify confidence scores are realistic (0.6-0.9 range)")
+                
+                # Create alert file for external monitoring
+                alert_file = f"/tmp/ml_model_critical_alert_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                with open(alert_file, 'w') as f:
+                    json.dump(alert, f, indent=2, default=str)
+                logger.critical(f"📝 Alert details saved to: {alert_file}")
+        
+        async def monitor_cycle(self):
+            """Single monitoring cycle"""
+            logger.info("🔍 Starting ML model monitoring cycle...")
+            
+            # Check service health
+            health_data = []
+            async with aiohttp.ClientSession() as session:
+                for service_name, endpoint in self.service_endpoints.items():
+                    health_result = await self.check_service_health(session, service_name, endpoint)
+                    health_data.append(health_result)
+                    logger.info(f"  {service_name}: {health_result['status']}")
+            
+            # Check database signals
+            db_data = self.check_database_signals()
+            if 'error' not in db_data:
+                logger.info(f"  Database: {db_data['total_signals']} signals, {db_data['fallback_signals']} fallback, avg confidence: {db_data['avg_confidence']:.3f}")
+            else:
+                logger.warning(f"  Database: {db_data['error']}")
+            
+            # Check for fallback mode
+            if 'fallback_signals' in db_data and db_data['fallback_signals'] > self.alert_conditions['max_fallback_signals']:
+                alert = {
+                    'type': 'FALLBACK_MODE_DETECTED',
+                    'severity': 'CRITICAL',
+                    'message': f"ML model fallback mode detected: {db_data['fallback_signals']} fallback signals in last hour",
+                    'data': db_data,
+                    'timestamp': datetime.now()
+                }
+                self.handle_critical_alert(alert)
+            
+            logger.info("✅ Monitoring cycle complete")
+            
+        async def run_continuous_monitoring(self):
+            """Run continuous monitoring"""
+            logger.info(f"🚀 Starting continuous ML model monitoring (every {self.monitoring_interval} minutes)")
+            
+            while True:
+                try:
+                    await self.monitor_cycle()
+                    await asyncio.sleep(self.monitoring_interval * 60)
+                except KeyboardInterrupt:
+                    logger.info("👋 Monitoring stopped by user")
+                    break
+                except Exception as e:
+                    logger.error(f"❌ Monitoring cycle failed: {e}")
+                    await asyncio.sleep(60)  # Wait 1 minute before retrying
+
+    async def main():
+        """Main monitoring function"""
+        monitor = MLModelMonitor()
+        await monitor.run_continuous_monitoring()
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-model-monitor
+  namespace: crypto-trading
+  labels:
+    app: ml-model-monitor
+spec:
+  selector:
+    app: ml-model-monitor
+  ports:
+  - name: monitor
+    port: 8080
+    targetPort: 8080
+  type: ClusterIP

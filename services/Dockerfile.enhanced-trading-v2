@@ -1,0 +1,61 @@
+# Enhanced Trading Engine V2 Dockerfile
+# Combines legacy functionality with modern architecture and LLM integration
+
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV TZ=UTC
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    curl \
+    pkg-config \
+    default-libmysqlclient-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
+COPY requirements.enhanced.txt /app/
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.enhanced.txt
+
+# Create necessary directories
+RUN mkdir -p /app/engines /app/shared /app/logs /app/ml_models_optimized
+
+# Copy application code
+COPY engines/ /app/engines/
+COPY shared/ /app/shared/
+
+    # Copy ML models and create directories
+    COPY ml_models_optimized_temp/ /app/ml_models_optimized/
+    
+    # Create health check endpoint script
+RUN echo '#!/bin/bash\ncurl -f http://localhost:8027/health || exit 1' > /app/healthcheck.sh && \
+    chmod +x /app/healthcheck.sh
+
+# Set proper permissions
+RUN chmod -R 755 /app
+
+# Expose port for the enhanced trading engine
+EXPOSE 8027
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD /app/healthcheck.sh
+
+# Default command
+CMD ["python", "/app/engines/enhanced_trading_engine_v2.py", "--container"]
+
+# Labels for container metadata
+LABEL name="enhanced-trading-engine-v2"
+LABEL version="2.0.0"
+LABEL description="Enhanced Trading Engine V2 - Unified architecture with legacy functionality and LLM integration"
+LABEL maintainer="CryptoAI Trading Team"

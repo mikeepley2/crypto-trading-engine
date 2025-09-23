@@ -1,0 +1,48 @@
+{
+  "coin": "filecoin",
+  "features": [
+    "sentiment_score_count_1h",
+    "confidence_mean_1h",
+    "confidence_std_1h",
+    "news_volume_1h",
+    "sentiment_score_count_4h",
+    "confidence_mean_4h",
+    "confidence_std_4h",
+    "news_volume_4h",
+    "sentiment_score_count_24h",
+    "confidence_mean_24h",
+    "confidence_std_24h",
+    "news_volume_24h",
+    "sentiment_score_count_7d",
+    "confidence_mean_7d",
+    "confidence_std_7d",
+    "news_volume_7d",
+    "market_sentiment_mean",
+    "open",
+    "high",
+    "low",
+    "volume_ma_24h",
+    "price_category_1h",
+    "price_category_4h",
+    "strong_movement_24h",
+    "price_category_24h"
+  ],
+  "training_date": "2025-07-02T02:25:51.225318+00:00",
+  "train_samples": 520,
+  "test_samples": 130,
+  "optimization_level": "high_performance",
+  "models": {
+    "RandomForest": {
+      "accuracy": 0.8846153846153846,
+      "roc_auc": 0.9661217720919213
+    },
+    "XGBoost": {
+      "accuracy": 0.8692307692307693,
+      "roc_auc": 0.9661217720919213
+    },
+    "LogisticRegression": {
+      "accuracy": 0.8692307692307693,
+      "roc_auc": 0.9661217720919213
+    }
+  }
+}

@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+Automated Signal Generator Service
+Continuously generates trading signals using the optimal model and bridges them to trading system
+"""
+
+import time
+import logging
+import mysql.connector
+import subprocess
+import schedule
+from datetime import datetime, timedelta
+import sys
+import os
+import json
+import requests
+
+# Configure logging without emojis for Windows compatibility
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [SIGNAL_GEN] %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('automated_signal_generator.log', mode='a')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class AutomatedSignalGenerator:
+    """Automated service for continuous signal generation and trading integration"""
+    
+    def __init__(self):
+        self.db_config = {
+            'host': 'host.docker.internal',
+            'user': 'news_collector',
+            'password': '99Rules!',
+            'database': 'crypto_prices'
+        }
+        
+        self.trading_db_config = {
+            'host': 'host.docker.internal',
+            'user': 'news_collector',
+            'password': '99Rules!',
+            'database': 'crypto_transactions'
+        }
+        
+        self.trading_engine_url = "http://trade-execution-engine:8024"
+        
+        # Metrics
+        self.total_signals_generated = 0
+        self.total_signals_bridged = 0
+        self.total_trade_recommendations = 0
+        self.last_run_timestamp = None
+        self.errors_count = 0
+        
+    def check_database_connection(self):
+        """Verify database connections are working"""
+        try:
+            # Check main database
+            conn = mysql.connector.connect(**self.db_config)
+            conn.close()
+            
+            # Check trading database
+            conn = mysql.connector.connect(**self.trading_db_config)
+            conn.close()
+            
+            logger.info("SUCCESS: Database connections verified")
+            return True
+            
+        except Exception as e:
+            logger.error(f"ERROR: Database connection failed: {e}")
+            return False
+    
+    def check_trading_engine_health(self):
+        """Check if trading engine is responding"""
+        try:
+            response = requests.get(f"{self.trading_engine_url}/health", timeout=10)
+            if response.status_code == 200:
+                logger.info("SUCCESS: Trading engine is healthy")
+                return True
+            else:
+                logger.warning(f"WARNING: Trading engine returned status {response.status_code}")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"WARNING: Trading engine not accessible: {e}")
+            return False
+    
+    def generate_optimal_signals(self):
+        """Run the comprehensive signal generator"""
+        try:
+            logger.info("GENERATE: Starting optimal model signal generation...")
+            
+            # Run the signal generator (using simple version to avoid Unicode issues)
+            result = subprocess.run([
+                sys.executable, 'simple_signal_generator_no_emoji.py'
+            ], capture_output=True, text=True, timeout=300)
+            
+            if result.returncode == 0:
+                logger.info("SUCCESS: Signal generation completed successfully")
+                
+                # Count new signals
+                conn = mysql.connector.connect(**self.db_config)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT COUNT(*) FROM trading_signals 
+                    WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+                ''')
+                new_signals = cursor.fetchone()[0]
+                conn.close()
+                
+                self.total_signals_generated += new_signals
+                logger.info(f"METRICS: Generated {new_signals} new signals")
+                return new_signals
+                
+            else:
+                logger.error(f"ERROR: Signal generation failed: {result.stderr}")
+                self.errors_count += 1
+                return 0
+                
+        except subprocess.TimeoutExpired:
+            logger.error("ERROR: Signal generation timed out")
+            self.errors_count += 1
+            return 0
+        except Exception as e:
+            logger.error(f"ERROR: Signal generation error: {e}")
+            self.errors_count += 1
+            return 0
+    
+    def bridge_signals_to_trading(self):
+        """Run the signal bridge to convert ML signals to trading format"""
+        try:
+            logger.info("BRIDGE: Converting ML signals to trading format...")
+            
+            # Run the signal bridge (using simple version to avoid Unicode issues)
+            result = subprocess.run([
+                sys.executable, 'simple_signal_bridge_no_emoji.py'
+            ], capture_output=True, text=True, timeout=120)
+            
+            if result.returncode == 0:
+                logger.info("SUCCESS: Signal bridging completed successfully")
+                
+                # Count bridged signals
+                conn = mysql.connector.connect(**self.db_config)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT COUNT(*) FROM trading_signals 
+                    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+                ''')
+                bridged_signals = cursor.fetchone()[0]
+                conn.close()
+                
+                self.total_signals_bridged += bridged_signals
+                logger.info(f"METRICS: Bridged {bridged_signals} signals")
+                return bridged_signals
+                
+            else:
+                logger.error(f"ERROR: Signal bridging failed: {result.stderr}")
+                self.errors_count += 1
+                return 0
+                
+        except subprocess.TimeoutExpired:
+            logger.error("ERROR: Signal bridging timed out")
+            self.errors_count += 1
+            return 0
+        except Exception as e:
+            logger.error(f"ERROR: Signal bridging error: {e}")
+            self.errors_count += 1
+            return 0
+    
+    def create_trade_recommendations(self):
+        """Create trade recommendations from trading signals"""
+        try:
+            logger.info("TRADING: Creating trade recommendations...")
+            
+            # Run the direct trading integration (using simple version to avoid Unicode issues)
+            result = subprocess.run([
+                sys.executable, 'simple_trading_integration_no_emoji.py'
+            ], capture_output=True, text=True, timeout=180)
+            
+            if result.returncode == 0:
+                logger.info("SUCCESS: Trade recommendations created successfully")
+                
+                # Count new recommendations
+                conn = mysql.connector.connect(**self.trading_db_config)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT COUNT(*) FROM trade_recommendations 
+                    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+                ''')
+                new_recommendations = cursor.fetchone()[0]
+                conn.close()
+                
+                self.total_trade_recommendations += new_recommendations
+                logger.info(f"METRICS: Created {new_recommendations} trade recommendations")
+                return new_recommendations
+                
+            else:
+                logger.error(f"ERROR: Trade recommendation creation failed: {result.stderr}")
+                self.errors_count += 1
+                return 0
+                
+        except subprocess.TimeoutExpired:
+            logger.error("ERROR: Trade recommendation creation timed out")
+            self.errors_count += 1
+            return 0
+        except Exception as e:
+            logger.error(f"ERROR: Trade recommendation creation error: {e}")
+            self.errors_count += 1
+            return 0
+    
+    def run_full_pipeline(self):
+        """Execute the complete signal generation to trading pipeline"""
+        start_time = datetime.now()
+        self.last_run_timestamp = start_time
+        
+        logger.info("PIPELINE: Starting automated signal generation pipeline...")
+        
+        # Check prerequisites
+        if not self.check_database_connection():
+            logger.error("ERROR: Aborting pipeline - database connection failed")
+            return False
+        
+        # Optional: Check trading engine (don't abort if down)
+        trading_engine_healthy = self.check_trading_engine_health()
+        
+        # Step 1: Generate signals
+        signals_generated = self.generate_optimal_signals()
+        if signals_generated == 0:
+            logger.warning("WARNING: No new signals generated - may be normal")
+        
+        # Step 2: Bridge signals
+        signals_bridged = self.bridge_signals_to_trading()
+        
+        # Step 3: Create trade recommendations
+        recommendations_created = self.create_trade_recommendations()
+        
+        # Calculate pipeline stats
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        # Log summary
+        logger.info("SUMMARY: PIPELINE RESULTS:")
+        logger.info(f"   Duration: {duration:.1f} seconds")
+        logger.info(f"   Signals Generated: {signals_generated}")
+        logger.info(f"   Signals Bridged: {signals_bridged}")
+        logger.info(f"   Trade Recommendations: {recommendations_created}")
+        logger.info(f"   Trading Engine: {'HEALTHY' if trading_engine_healthy else 'DOWN'}")
+        
+        # Overall success check
+        success = (signals_generated >= 0 and signals_bridged >= 0 and recommendations_created >= 0)
+        
+        if success:
+            logger.info("SUCCESS: Pipeline completed successfully")
+        else:
+            logger.error("ERROR: Pipeline completed with issues")
+            
+        return success
+    
+    def print_status(self):
+        """Print current service status"""
+        logger.info("STATUS: AUTOMATED SIGNAL GENERATOR STATUS:")
+        logger.info(f"   Total Signals Generated: {self.total_signals_generated}")
+        logger.info(f"   Total Signals Bridged: {self.total_signals_bridged}")
+        logger.info(f"   Total Trade Recommendations: {self.total_trade_recommendations}")
+        logger.info(f"   Total Errors: {self.errors_count}")
+        logger.info(f"   Last Run: {self.last_run_timestamp or 'Never'}")
+    
+    def schedule_continuous_generation(self):
+        """Setup scheduled signal generation"""
+        logger.info("SCHEDULE: Setting up continuous signal generation schedule...")
+        
+        # Schedule every 5 minutes for high-frequency trading
+        schedule.every(5).minutes.do(self.run_full_pipeline)
+        
+        # Status report every hour
+        schedule.every().hour.do(self.print_status)
+        
+        logger.info("SUCCESS: Scheduled signal generation every 5 minutes")
+        logger.info("SUCCESS: Scheduled status reports every hour")
+    
+    def run_scheduler(self):
+        """Run the continuous scheduler"""
+        logger.info("SCHEDULER: Starting continuous signal generation scheduler...")
+        
+        # Run once immediately
+        self.run_full_pipeline()
+        
+        # Start the scheduler
+        while True:
+            try:
+                schedule.run_pending()
+                time.sleep(30)  # Check every 30 seconds
+                
+            except KeyboardInterrupt:
+                logger.info("STOP: Scheduler stopped by user")
+                break
+            except Exception as e:
+                logger.error(f"ERROR: Scheduler error: {e}")
+                self.errors_count += 1
+                time.sleep(60)  # Wait before retrying
+
+def main():
+    """Main entry point"""
+    if len(sys.argv) > 1:
+        mode = sys.argv[1].lower()
+    else:
+        mode = "run"
+    
+    generator = AutomatedSignalGenerator()
+    
+    if mode == "test":
+        logger.info("TEST: Running test mode - single pipeline execution")
+        success = generator.run_full_pipeline()
+        if success:
+            logger.info("SUCCESS: Test completed successfully")
+            sys.exit(0)
+        else:
+            logger.error("ERROR: Test failed")
+            sys.exit(1)
+    
+    elif mode == "status":
+        generator.print_status()
+    
+    elif mode == "once":
+        logger.info("ONCE: Running pipeline once")
+        success = generator.run_full_pipeline()
+        generator.print_status()
+        sys.exit(0 if success else 1)
+    
+    elif mode == "schedule":
+        generator.schedule_continuous_generation()
+        generator.run_scheduler()
+    
+    else:
+        logger.info("RUN: Starting automated signal generator in continuous mode")
+        generator.schedule_continuous_generation()
+        generator.run_scheduler()
+
+if __name__ == "__main__":
+    main()

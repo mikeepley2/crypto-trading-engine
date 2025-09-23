@@ -1,0 +1,1649 @@
+#!/usr/bin/env python3
+"""
+Trade Execution Engine with Coinbase Integration
+Real cryptocurrency trading with comprehensive risk management
+"""
+
+import os
+import json
+import time
+import logging
+import sys
+import requests
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+import mysql.connector
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uvicorn
+from dotenv import load_dotenv
+
+# Import our Coinbase API integration
+from coinbase_api import CoinbaseAdvancedTradeAPI, CoinbaseRiskManager
+
+# Import symbol standardization utility
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../..')))
+from symbol_utils import SymbolStandardizer, normalize_symbol, to_coinbase_format
+
+# Notification service configuration
+NOTIFICATION_SERVICE_URL = "http://notification-service.crypto-monitoring.svc.cluster.local:8038"
+
+# LLM validation service configuration  
+LLM_VALIDATION_SERVICE_URL = "http://llm-trade-validator.crypto-trading.svc.cluster.local:8035"
+
+# Load environment variables
+load_dotenv('../../../.env.live')  # Relative path
+load_dotenv('e:/git/aitest/.env.live')  # Absolute path fallback
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trade_execution.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def send_trade_notification(trade_data: Dict):
+    """Send trade notification via notification service"""
+    try:
+        # Prepare notification message
+        if trade_data.get('status') == 'SUCCESS':
+            title = f"✅ Trade Executed: {trade_data['action']} {trade_data['symbol']}"
+            message = f"""
+Trade Successfully Executed:
+• Symbol: {trade_data['symbol']}
+• Action: {trade_data['action']}
+• Amount: ${trade_data['size_usd']:.2f}
+• Price: ${trade_data.get('price', 'N/A')}
+• Order ID: {trade_data.get('order_id', 'N/A')}
+• Time: {trade_data.get('timestamp', datetime.now().isoformat())}
+            """.strip()
+        else:
+            title = f"❌ Trade Failed: {trade_data['action']} {trade_data['symbol']}"
+            message = f"""
+Trade Execution Failed:
+• Symbol: {trade_data['symbol']}
+• Action: {trade_data['action']}
+• Amount: ${trade_data['size_usd']:.2f}
+• Error: {trade_data.get('error', 'Unknown error')}
+• Time: {trade_data.get('timestamp', datetime.now().isoformat())}
+            """.strip()
+        
+        # Send notification
+        response = requests.post(
+            f"{NOTIFICATION_SERVICE_URL}/send",
+            json={
+                "type": "email",
+                "title": title,
+                "message": message
+            },
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"Trade notification sent successfully: {title}")
+        else:
+            logger.warning(f"Notification failed with status {response.status_code}: {response.text}")
+            
+    except Exception as e:
+        logger.error(f"Failed to send trade notification: {e}")
+
+    except Exception as e:
+        logger.error(f"Failed to send trade notification: {e}")
+
+async def validate_trade_with_llm(trade_request, current_price: float) -> Dict[str, Any]:
+    """Validate trade using LLM analysis service"""
+    try:
+        # Prepare validation request
+        validation_data = {
+            "symbol": trade_request.symbol,
+            "action": trade_request.action,
+            "size_usd": trade_request.size_usd,
+            "current_price": current_price,
+            "ml_signal_confidence": 0.0,  # Default value instead of None
+            "ml_signal_direction": "neutral"  # Default value instead of None
+        }
+        
+        # Call LLM validation service
+        response = requests.post(
+            f"{LLM_VALIDATION_SERVICE_URL}/validate",
+            json=validation_data,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            validation_result = response.json()
+            logger.info(f"LLM validation result for {trade_request.symbol} {trade_request.action}: {validation_result['decision']} (confidence: {validation_result['confidence']:.2f})")
+            return validation_result
+        else:
+            logger.error(f"LLM validation service returned {response.status_code}: {response.text}")
+            raise HTTPException(status_code=503, detail=f"LLM validation service unavailable: {response.status_code}")
+            
+    except Exception as e:
+        logger.error(f"Failed to validate trade with LLM: {e}")
+        raise HTTPException(status_code=503, detail=f"LLM validation failed: {e}")
+
+def validate_trade_with_llm_sync(trade_request, current_price: float) -> Dict[str, Any]:
+    """Synchronous version of LLM validation to avoid event loop conflicts"""
+    try:
+        # Prepare validation request
+        validation_data = {
+            "symbol": trade_request.symbol,
+            "action": trade_request.action,
+            "size_usd": trade_request.size_usd,
+            "current_price": current_price,
+            "ml_signal_confidence": None,  # Could be passed from signal data
+            "ml_signal_direction": None
+        }
+        
+        # Call LLM validation service (synchronous)
+        response = requests.post(
+            f"{LLM_VALIDATION_SERVICE_URL}/validate",
+            json=validation_data,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            validation_result = response.json()
+            logger.info(f"LLM validation result for {trade_request.symbol} {trade_request.action}: {validation_result['decision']} (confidence: {validation_result['confidence']:.2f})")
+            return validation_result
+        else:
+            logger.error(f"LLM validation service returned {response.status_code}: {response.text}")
+            raise Exception(f"LLM validation service unavailable: {response.status_code}")
+            
+    except Exception as e:
+        logger.error(f"Failed to validate trade with LLM: {e}")
+        raise Exception(f"LLM validation failed: {e}")
+
+@dataclass
+class TradeRequest:
+    symbol: str
+    action: str  # BUY/SELL
+    size_usd: float
+    order_type: str = "MARKET"  # MARKET/LIMIT
+    limit_price: Optional[float] = None
+    stop_loss_percent: Optional[float] = None
+    take_profit_percent: Optional[float] = None
+
+# --- New: Mock Coinbase API for EXECUTION_MODE=mock ---
+class MockCoinbaseAPI:
+    """Minimal mock of Coinbase API used by the engine for dry-run trading."""
+    def __init__(self, starting_usd: float = 10000.0):
+        self._usd_balance = starting_usd
+        self._positions = {}  # currency -> balance
+
+    def validate_connection(self) -> bool:
+        return True
+
+    def get_account_balance(self, currency: str) -> float:
+        if currency.upper() == 'USD':
+            return self._usd_balance
+        return float(self._positions.get(currency.upper(), 0.0))
+
+    def get_positions(self) -> List[Dict[str, Any]]:
+        return [
+            {"currency": k, "balance": v}
+            for k, v in self._positions.items() if v > 0
+        ]
+
+    def get_current_price(self, product_id: str) -> float:
+        # Simple deterministic pseudo-price for mock (not market data)
+        # e.g., BTC-USD -> base varies by hash
+        base = sum(ord(c) for c in product_id) % 200 + 50
+        return float(base)
+
+    def get_product_info(self, product_id: str) -> Dict[str, Any]:
+        return {"base_increment": "0.00000001"}
+
+    def place_market_order(self, product_id: str, side: str, size: str) -> Dict[str, Any]:
+        price = self.get_current_price(product_id)
+        qty = float(size)
+        base = product_id.split('-')[0]
+        notional = qty * price
+        if side.upper() == 'BUY':
+            if self._usd_balance < notional:
+                raise Exception("Insufficient USD balance (mock)")
+            self._usd_balance -= notional
+            self._positions[base] = self._positions.get(base, 0.0) + qty
+        else:
+            held = self._positions.get(base, 0.0)
+            if held < qty:
+                raise Exception("Insufficient position (mock)")
+            self._positions[base] = held - qty
+            self._usd_balance += notional
+        return {"order_id": f"mock-{int(time.time()*1000)}"}
+
+    def place_limit_order(self, product_id: str, side: str, size: str, price: str) -> Dict[str, Any]:
+        # For mock, assume immediate execution at limit price
+        qty = float(size)
+        limit_price = float(price)
+        base = product_id.split('-')[0]
+        notional = qty * limit_price
+        if side.upper() == 'BUY':
+            if self._usd_balance < notional:
+                raise Exception("Insufficient USD balance (mock)")
+            self._usd_balance -= notional
+            self._positions[base] = self._positions.get(base, 0.0) + qty
+        else:
+            held = self._positions.get(base, 0.0)
+            if held < qty:
+                raise Exception("Insufficient position (mock)")
+            self._positions[base] = held - qty
+            self._usd_balance += notional
+        return {"order_id": f"mock-{int(time.time()*1000)}"}
+
+@dataclass
+class TradeExecutionConfig:
+    execution_mode: str  # 'live' or 'mock'
+
+class TradeExecutionEngine:
+    """Real cryptocurrency trading execution engine with safety features"""
+    
+    def __init__(self):
+        # Initialize configuration
+        self.load_config()
+
+        # Execution mode
+        self.exec_mode = TradeExecutionConfig(
+            execution_mode=os.getenv('EXECUTION_MODE', 'mock').lower()
+        )
+        if self.exec_mode.execution_mode not in ('live', 'mock'):
+            self.exec_mode.execution_mode = 'mock'
+        logger.info(f"[CONFIG] Execution mode: {self.exec_mode.execution_mode}")
+        
+        # Initialize Coinbase API or mock
+        if self.exec_mode.execution_mode == 'live':
+            self.coinbase_api = CoinbaseAdvancedTradeAPI(
+                api_key=self.config.get('COINBASE_API_KEY'),
+                private_key=self.config.get('COINBASE_PRIVATE_KEY'),
+                base_url=self.config.get('COINBASE_BASE_URL')
+            )
+            logger.info(f"🔴 [API_TYPE] Using LIVE CoinbaseAdvancedTradeAPI instance")
+        else:
+            self.coinbase_api = MockCoinbaseAPI(
+                starting_usd=float(os.getenv('MOCK_STARTING_USD', '10000'))
+            )
+            logger.info(f"🔴 [API_TYPE] Using MOCK CoinbaseAPI instance")
+        
+        # Initialize risk manager
+        self.risk_manager = CoinbaseRiskManager(
+            coinbase_api=self.coinbase_api,
+            max_position_size_usd=float(self.config['MAX_POSITION_SIZE_USD'])
+        )
+        # Initialize database connection
+        self.db_config = {
+            'host': self.config['DB_HOST'],
+            'user': self.config['DB_USER'],
+            'password': self.config['DB_PASSWORD'],
+            'database': self.config['DB_NAME_TRANSACTIONS']
+        }
+        self.db_available = True
+
+        # Trading state
+        # Check if trading is enabled (live only)
+        self.is_trading_enabled = os.getenv('TRADE_EXECUTION_ENABLED', 'false').lower() == 'true'
+        self.daily_stats = {
+            'trades_executed': 0,
+            'total_volume': 0.0,
+            'realized_pnl': 0.0,
+            'last_reset': datetime.now().date()
+        }
+
+        # Portfolio caching for performance optimization
+        self.portfolio_cache = None
+        self.portfolio_cache_timestamp = None
+        self.portfolio_cache_ttl = 30  # 30 seconds cache TTL - balance between performance and freshness
+
+        # Validate connection
+        self.validate_setup()
+        
+    def load_config(self):
+        """Load configuration from environment variables"""
+        # Required for both modes
+        base_required = [
+            'MAX_POSITION_SIZE_USD', 'MAX_DAILY_TRADES', 'MAX_DAILY_LOSS_USD',
+            'DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME_TRANSACTIONS', 'DB_NAME_PRICES'
+        ]
+        # Live-only requirements
+        live_required = [
+            'COINBASE_API_KEY', 'COINBASE_PRIVATE_KEY', 'COINBASE_BASE_URL'
+        ]
+        self.config = {}
+        missing_vars = []
+
+        # Determine mode early
+        mode = os.getenv('EXECUTION_MODE', 'mock').lower()
+
+        for var in base_required + (live_required if mode == 'live' else []):
+            value = os.getenv(var)
+            if value is None:
+                missing_vars.append(var)
+            else:
+                self.config[var] = value
+        
+        if missing_vars:
+            raise ValueError(f"Missing required environment variables: {missing_vars}")
+        
+        # Optional variables with defaults
+        self.config['LIVE_TRADING_ENABLED'] = os.getenv('LIVE_TRADING_ENABLED', 'false')
+        self.config['MIN_TRADE_SIZE_USD'] = os.getenv('MIN_TRADE_SIZE_USD', '25.00')  # Increased from $10 to $25 to reduce excessive micro-trades
+        self.config['MIN_LIQUIDATION_VALUE_USD'] = os.getenv('MIN_LIQUIDATION_VALUE_USD', '5.00')  # Lower minimum for SELL/liquidation orders
+        self.config['STOP_LOSS_PERCENT'] = os.getenv('STOP_LOSS_PERCENT', '0.05')
+        self.config['TAKE_PROFIT_PERCENT'] = os.getenv('TAKE_PROFIT_PERCENT', '0.10')
+        
+        # Duplicate trade prevention settings
+        self.config['DUPLICATE_TRADE_WINDOW_SECONDS'] = int(os.getenv('DUPLICATE_TRADE_WINDOW_SECONDS', '120'))  # 2 minutes
+        self.config['ENABLE_DUPLICATE_PREVENTION'] = os.getenv('ENABLE_DUPLICATE_PREVENTION', 'true').lower() == 'true'
+        
+        logger.info("[+] Configuration loaded successfully")
+    
+    def validate_setup(self):
+        """Validate the trading setup"""
+        try:
+            # Test Coinbase/Mock API connection
+            if not self.coinbase_api.validate_connection():
+                raise Exception("Coinbase/Mock API connection failed")
+            
+            # Test database connection (graceful in mock mode)
+            try:
+                conn = mysql.connector.connect(**self.db_config)
+                conn.close()
+                self.db_available = True
+            except Exception as db_err:
+                if self.exec_mode.execution_mode == 'mock':
+                    self.db_available = False
+                    logger.warning(f"[!] Database not reachable in mock mode - continuing without DB writes: {db_err}")
+                else:
+                    raise
+            
+            # Get current balance (USD)
+            balance = self.coinbase_api.get_account_balance('USD')
+            logger.info(f"[+] {self.exec_mode.execution_mode.capitalize()} trading setup validated - USD Balance: ${balance}")
+            
+            if float(balance) < float(self.config['MIN_TRADE_SIZE_USD']):
+                logger.warning(f"[!] Low balance: ${balance} - minimum trade size: ${self.config['MIN_TRADE_SIZE_USD']}")
+            
+        except Exception as e:
+            logger.error(f"[!] Setup validation failed: {e}")
+            raise
+    
+    def reset_daily_stats(self):
+        """Reset daily statistics if new day"""
+        today = datetime.now().date()
+        if self.daily_stats['last_reset'] != today:
+            self.daily_stats = {
+                'trades_executed': 0,
+                'total_volume': 0.0,
+                'realized_pnl': 0.0,
+                'last_reset': today
+            }
+            self.risk_manager.daily_trades = 0
+            self.risk_manager.daily_loss = 0.0
+            logger.info("[INFO] Daily statistics reset")
+    
+    def check_duplicate_trade(self, symbol: str, action: str, size_usd: float) -> bool:
+        """Check if an identical trade was executed recently to prevent duplicates"""
+        if not self.config['ENABLE_DUPLICATE_PREVENTION'] or not self.db_available:
+            return False
+            
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor()
+            
+            # Check for identical trades in the last N seconds
+            window_seconds = self.config['DUPLICATE_TRADE_WINDOW_SECONDS']
+            
+            cursor.execute("""
+                SELECT COUNT(*) FROM trades 
+                WHERE symbol = %s 
+                AND action = %s 
+                AND ABS(size_usd - %s) < 0.01
+                AND timestamp >= NOW() - INTERVAL %s SECOND
+                AND status IN ('EXECUTED', 'PENDING')
+            """, (symbol, action, size_usd, window_seconds))
+            
+            count = cursor.fetchone()[0]
+            cursor.close()
+            conn.close()
+            
+            if count > 0:
+                logger.warning(f"[DUPLICATE_CHECK] ⚠️ Found {count} identical trade(s) for {symbol} {action} ${size_usd:.2f} in last {window_seconds}s")
+                return True
+            
+            logger.debug(f"[DUPLICATE_CHECK] ✅ No duplicate trades found for {symbol} {action} ${size_usd:.2f}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"[DUPLICATE_CHECK] Error checking for duplicates: {e}")
+            return False  # Allow trade if check fails
+    
+    def get_position_size(self, symbol: str, size_usd: float, current_price: float) -> str:
+        """Calculate position size based on USD amount and current price"""
+        logger.info(f"[POSITION_SIZE] Calculating size for {symbol}: ${size_usd} at ${current_price}")
+        try:
+            # Validate inputs
+            if size_usd <= 0:
+                logger.error(f"[ERROR] Invalid size_usd: {size_usd}")
+                return "0"
+            if current_price <= 0:
+                logger.error(f"[ERROR] Invalid current_price: {current_price}")
+                return "0"
+                
+            # Convert USD amount to base currency amount
+            base_size = size_usd / current_price
+            logger.info(f"[POSITION_SIZE] ${size_usd} / ${current_price} = {base_size}")
+            
+            # Get product info for precision - use Coinbase format for API
+            coinbase_product_id = to_coinbase_format(symbol)
+            product_info = self.coinbase_api.get_product_info(coinbase_product_id)
+            
+            # Round to appropriate precision (usually 8 decimal places for crypto)
+            precision = 8
+            increment = None
+            if 'base_increment' in product_info:
+                # Calculate precision from increment - handle scientific notation properly
+                increment = float(product_info['base_increment'])
+                logger.info(f"[POSITION_SIZE] Raw increment value: {increment} (type: {type(increment)}, repr: {repr(increment)})")
+                
+                # Handle different increment types properly - use robust floating point comparison
+                if increment >= 0.999999999:  # Handle floating point precision issues for increment >= 1.0
+                    # For increments like 1.0, 10.0 etc - these require whole numbers
+                    precision = 0
+                    logger.info(f"[POSITION_SIZE] Large increment detected ({increment}), setting precision to 0")
+                else:
+                    # For small increments, use mathematical approach to avoid floating point issues
+                    if abs(increment - 0.1) < 1e-10:
+                        precision = 1
+                    elif abs(increment - 0.01) < 1e-10:
+                        precision = 2
+                    elif abs(increment - 0.001) < 1e-10:
+                        precision = 3
+                    elif abs(increment - 0.0001) < 1e-10:
+                        precision = 4
+                    elif abs(increment - 1e-8) < 1e-15:
+                        precision = 8
+                    else:
+                        # Fallback: count decimal places from string representation
+                        increment_str = f"{increment:.20f}".rstrip('0').rstrip('.')
+                        if '.' in increment_str:
+                            precision = len(increment_str.split('.')[-1])
+                        else:
+                            precision = 0
+                        logger.info(f"[POSITION_SIZE] Fallback precision calculation: '{increment_str}' -> {precision}")
+                
+                logger.info(f"[POSITION_SIZE] Using increment {increment}, precision {precision}")
+            else:
+                logger.info(f"[POSITION_SIZE] No base_increment found, using default precision {precision}")
+            
+            # For whole number precision, round to nearest integer
+            if precision == 0:
+                result = str(int(round(base_size)))
+            else:
+                result = f"{base_size:.{precision}f}"
+                # Remove trailing zeros but keep at least one decimal place for decimals
+                if '.' in result:
+                    result = result.rstrip('0').rstrip('.')
+                    if '.' not in result and precision > 0:
+                        result += ".0"
+            
+            logger.info(f"[POSITION_SIZE] Final result: {result}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Error calculating position size: {e}")
+            fallback_result = f"{size_usd / current_price:.8f}"
+            logger.error(f"[ERROR] Using fallback position size: {fallback_result}")
+            return fallback_result
+    
+    def calculate_coinbase_fees(self, trade_amount_usd: float, order_type: str = "MARKET") -> Dict[str, float]:
+        """Calculate estimated Coinbase Advanced Trade fees"""
+        # Coinbase Advanced Trade fee structure (as of 2024)
+        # Market orders: ~0.6% taker fee for smaller accounts
+        # Limit orders: ~0.4% maker fee when they add liquidity
+        # These are estimates - actual fees may vary based on account tier
+        
+        if order_type.upper() == "MARKET":
+            fee_rate = 0.006  # 0.6% taker fee estimate
+        else:  # LIMIT
+            fee_rate = 0.004  # 0.4% maker fee estimate
+        
+        estimated_fee = trade_amount_usd * fee_rate
+        total_cost = trade_amount_usd + estimated_fee
+        
+        logger.info(f"[FEE_CALC] Trade: ${trade_amount_usd:.2f}, Est. fee: ${estimated_fee:.4f} ({fee_rate*100:.1f}%), Total: ${total_cost:.2f}")
+        
+        return {
+            "trade_amount": trade_amount_usd,
+            "estimated_fee": estimated_fee,
+            "fee_rate": fee_rate,
+            "total_cost": total_cost
+        }
+    
+    def _validate_trade_with_llm_sync(self, trade_request, current_price: float) -> Dict[str, Any]:
+        """Synchronous LLM validation method for TradeExecutionEngine"""
+        try:
+            # Prepare validation request
+            validation_data = {
+                "symbol": trade_request.symbol,
+                "action": trade_request.action,
+                "size_usd": trade_request.size_usd,
+                "current_price": current_price,
+                "ml_signal_confidence": 0.0,  # Default value instead of None
+                "ml_signal_direction": "neutral"  # Default value instead of None
+            }
+            
+            # Call LLM validation service (synchronous)
+            response = requests.post(
+                f"{LLM_VALIDATION_SERVICE_URL}/validate",
+                json=validation_data,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                validation_result = response.json()
+                logger.info(f"LLM validation result for {trade_request.symbol} {trade_request.action}: {validation_result['decision']} (confidence: {validation_result['confidence']:.2f})")
+                return validation_result
+            else:
+                logger.warning(f"LLM validation service returned {response.status_code}: {response.text}")
+                return {
+                    "decision": "approve",  # Default to approve if service unavailable
+                    "confidence": 0.5,
+                    "reasoning": "LLM validation service unavailable, using default approval",
+                    "risk_assessment": "medium",
+                    "warnings": ["LLM validation service unavailable"]
+                }
+                
+        except Exception as e:
+            logger.error(f"Failed to validate trade with LLM: {e}")
+            return {
+                "decision": "approve",  # Default to approve if validation fails
+                "confidence": 0.3,
+                "reasoning": f"LLM validation failed: {e}",
+                "risk_assessment": "medium",
+                "warnings": ["LLM validation failed"]
+            }
+    
+    def execute_trade(self, trade_request: TradeRequest) -> Dict:
+        """Execute a trade (live or mock depending on mode)"""
+        self.reset_daily_stats()
+        
+        logger.info(f"[DEBUG] === EXECUTE_TRADE STARTED ===")
+        logger.info(f"[DEBUG] Trade request: {trade_request.symbol} {trade_request.action} ${trade_request.size_usd}")
+        logger.info(f"[DEBUG] MIN_TRADE_SIZE_USD config: {self.config.get('MIN_TRADE_SIZE_USD', 'NOT SET')}")
+        
+        try:
+            # SYMBOL STANDARDIZATION: Normalize input symbol to base format
+            base_symbol = normalize_symbol(trade_request.symbol)
+            logger.info(f"[SYMBOL] Normalized '{trade_request.symbol}' -> '{base_symbol}'")
+            
+            # Get current price first (needed for LLM validation)
+            # Use Coinbase format for API calls
+            # Use Coinbase format for API calls
+            coinbase_product_id = to_coinbase_format(base_symbol)
+            current_price = self.coinbase_api.get_current_price(coinbase_product_id)
+            
+            # Enhanced price validation - handle legitimate symbols with temporary price unavailability
+            if current_price <= 0:
+                # Check if this is a known valid symbol that might have temporary price issues
+                valid_symbols = SymbolStandardizer.get_supported_symbols()
+                if base_symbol in valid_symbols:
+                    logger.warning(f"[WARNING] Price unavailable for {coinbase_product_id}, attempting fallback price fetch")
+                    
+                    # Try to get price from alternative source or use a conservative fallback
+                    # For now, we'll use a recent price from our database as fallback
+                    try:
+                        conn = mysql.connector.connect(
+                            host=self.config['DB_HOST'],
+                            user=self.config['DB_USER'],
+                            password=self.config['DB_PASSWORD'],
+                            database=self.config['DB_NAME_PRICES']
+                        )
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            SELECT current_price 
+                            FROM price_data 
+                            WHERE symbol = %s 
+                            ORDER BY timestamp_iso DESC 
+                            LIMIT 1
+                        ''', (base_symbol,))
+                        
+                        result = cursor.fetchone()
+                        if result and result[0] and float(result[0]) > 0:
+                            current_price = float(result[0])
+                            logger.info(f"[FALLBACK] Using database price for {coinbase_product_id}: ${current_price}")
+                        else:
+                            cursor.close()
+                            conn.close()
+                            raise Exception(f"No fallback price available for {coinbase_product_id}")
+                        
+                        cursor.close()
+                        conn.close()
+                        
+                    except Exception as fallback_error:
+                        logger.error(f"[ERROR] Fallback price fetch failed: {fallback_error}")
+                        raise Exception(f"Price unavailable for {coinbase_product_id} (API: {current_price}, DB fallback failed)")
+                else:
+                    raise Exception(f"Invalid symbol or price unavailable for {coinbase_product_id}")
+            
+            # DUPLICATE TRADE PREVENTION: Check for recent identical trades
+            logger.info(f"[DEBUG] About to check duplicate trades for {base_symbol} {trade_request.action} ${trade_request.size_usd}")
+            if self.check_duplicate_trade(base_symbol, trade_request.action, trade_request.size_usd):
+                logger.warning(f"[DUPLICATE_PREVENTION] ❌ Rejecting duplicate trade: {base_symbol} {trade_request.action} ${trade_request.size_usd:.2f}")
+                return {
+                    'success': False,
+                    'error': f'Duplicate trade prevented: identical {trade_request.action} order for ${trade_request.size_usd:.2f} {base_symbol} executed recently',
+                    'symbol': base_symbol,
+                    'action': trade_request.action,
+                    'size_usd': trade_request.size_usd,
+                    'duplicate_prevention': True
+                }
+            
+            # MINIMUM TRADE SIZE VALIDATION: Enhanced minimum size check
+            logger.info(f"[DEBUG] About to check minimum trade size")
+            min_trade_size = float(self.config['MIN_TRADE_SIZE_USD'])
+            logger.info(f"[DEBUG] Min trade size: ${min_trade_size}, Trade size: ${trade_request.size_usd}")
+            if trade_request.size_usd < min_trade_size:
+                logger.warning(f"[MIN_SIZE] ❌ Trade size ${trade_request.size_usd:.2f} below minimum ${min_trade_size:.2f}")
+                return {
+                    'success': False,
+                    'error': f'Trade size ${trade_request.size_usd:.2f} below minimum ${min_trade_size:.2f}',
+                    'symbol': base_symbol,
+                    'action': trade_request.action,
+                    'size_usd': trade_request.size_usd,
+                    'min_size_violation': True
+                }
+            
+            logger.info(f"[DEBUG] Minimum size validation passed, proceeding to LLM validation")
+            
+            # LLM VALIDATION: Validate trade with comprehensive LLM analysis (AFTER duplicate check)
+            logger.info(f"[LLM_VALIDATION] Requesting LLM validation for {base_symbol} {trade_request.action} ${trade_request.size_usd}")
+            llm_validation = None
+            
+            try:
+                # Call LLM validation (sync version to avoid event loop conflicts)
+                llm_validation = self._validate_trade_with_llm_sync(trade_request, current_price)
+                
+                # Check LLM decision
+                llm_decision = llm_validation.get('decision', 'approve').lower()
+                llm_confidence = llm_validation.get('confidence', 0.5)
+                llm_reasoning = llm_validation.get('reasoning', 'No reasoning provided')
+                
+                logger.info(f"[LLM_VALIDATION] Decision: {llm_decision.upper()}, Confidence: {llm_confidence:.2f}")
+                logger.info(f"[LLM_VALIDATION] Reasoning: {llm_reasoning}")
+                
+                # Handle LLM rejection
+                if llm_decision == 'reject':
+                    logger.warning(f"[LLM_VALIDATION] ❌ Trade REJECTED by LLM: {llm_reasoning}")
+                    return {
+                        'success': False,
+                        'error': f"Trade rejected by LLM analysis: {llm_reasoning}",
+                        'llm_validation': llm_validation,
+                        'symbol': base_symbol,
+                        'action': trade_request.action,
+                        'size_usd': trade_request.size_usd
+                    }
+                
+                # Handle LLM deferral (treat as low-confidence approval)
+                elif llm_decision == 'defer':
+                    logger.warning(f"[LLM_VALIDATION] ⚠️ Trade DEFERRED by LLM, proceeding with caution: {llm_reasoning}")
+                
+                # Handle LLM modification suggestions
+                elif llm_decision == 'modify':
+                    logger.info(f"[LLM_VALIDATION] 🔧 Trade MODIFICATION suggested by LLM: {llm_reasoning}")
+                    # Could implement trade modifications here (size adjustments, etc.)
+                
+                else:  # approve
+                    logger.info(f"[LLM_VALIDATION] ✅ Trade APPROVED by LLM: {llm_reasoning}")
+                
+                # Log any warnings from LLM
+                warnings = llm_validation.get('warnings', [])
+                if warnings:
+                    logger.warning(f"[LLM_VALIDATION] Warnings: {'; '.join(warnings)}")
+                
+            except Exception as llm_error:
+                logger.error(f"[LLM_VALIDATION] LLM validation failed: {llm_error}")
+                # Continue with trade but log the failure
+                llm_validation = {
+                    'decision': 'approve',
+                    'confidence': 0.3,
+                    'reasoning': f'LLM validation failed: {llm_error}',
+                    'risk_assessment': 'medium',
+                    'warnings': ['LLM validation service unavailable']
+                }
+            
+            # Calculate fees and adjust trade size for fee considerations
+            fee_info = self.calculate_coinbase_fees(trade_request.size_usd, trade_request.order_type)
+            
+            # For BUY orders, check if we can afford the trade + fees
+            if trade_request.action.upper() == 'BUY':
+                total_cost_with_fees = fee_info['total_cost']
+                logger.info(f"[FEE_CHECK] BUY order total cost with fees: ${total_cost_with_fees:.2f}")
+                
+                # Risk management check with fee-adjusted amount
+                if not self.risk_manager.can_place_trade(total_cost_with_fees, trade_request.action):
+                    return {
+                        'success': False,
+                        'error': f'Trade rejected by risk management - insufficient funds for ${total_cost_with_fees:.2f} (${trade_request.size_usd:.2f} + ${fee_info["estimated_fee"]:.2f} fee)',
+                        'llm_validation': llm_validation,
+                        'symbol': base_symbol,
+                        'action': trade_request.action,
+                        'size_usd': trade_request.size_usd,
+                        'fee_info': fee_info
+                    }
+            else:
+                # For SELL orders, regular risk check (rebalancing)
+                if not self.risk_manager.can_place_trade(trade_request.size_usd, trade_request.action):
+                    return {
+                        'success': False,
+                        'error': 'Trade rejected by risk management',
+                        'llm_validation': llm_validation,
+                        'symbol': base_symbol,
+                        'action': trade_request.action,
+                        'size_usd': trade_request.size_usd,
+                        'fee_info': fee_info
+                    }
+            
+            # Calculate position size using base symbol for consistency
+            position_size = self.get_position_size(
+                base_symbol, 
+                trade_request.size_usd, 
+                current_price
+            )
+            
+            # Live vs mock execution - use Coinbase format for API calls
+            if self.exec_mode.execution_mode == 'live':
+                if not self.is_trading_enabled:
+                    raise Exception("Live trading is disabled")
+                
+                if trade_request.order_type == "MARKET":
+                    order_response = self.coinbase_api.place_market_order(
+                        product_id=coinbase_product_id,
+                        side=trade_request.action,
+                        size=position_size
+                    )
+                elif trade_request.order_type == "LIMIT" and trade_request.limit_price:
+                    order_response = self.coinbase_api.place_limit_order(
+                        product_id=coinbase_product_id,
+                        side=trade_request.action,
+                        size=position_size,
+                        price=str(trade_request.limit_price)
+                    )
+                else:
+                    raise Exception("Invalid order type or missing limit price")
+                table_name = 'trades'
+            else:
+                # Mock immediate fill - use Coinbase format for API simulation
+                if trade_request.order_type == "MARKET":
+                    order_response = self.coinbase_api.place_market_order(
+                        product_id=coinbase_product_id,
+                        side=trade_request.action,
+                        size=position_size
+                    )
+                elif trade_request.order_type == "LIMIT" and trade_request.limit_price:
+                    order_response = self.coinbase_api.place_limit_order(
+                        product_id=coinbase_product_id,
+                        side=trade_request.action,
+                        size=position_size,
+                        price=str(trade_request.limit_price)
+                    )
+                else:
+                    raise Exception("Invalid order type or missing limit price")
+                table_name = 'mock_trades'
+            
+            # Get order ID for verification
+            order_id = order_response.get('order_id')
+            
+            # Debug execution mode
+            logger.info(f"[DEBUG] Execution mode: '{self.exec_mode.execution_mode}', order_id: {order_id}")
+            
+            # Verify order completion (only for live trading)
+            verification_result = None
+            final_status = 'PENDING'  # Default status
+            
+            if self.exec_mode.execution_mode == 'live':
+                # Live trading mode
+                logger.info(f"[DEBUG] Entering live trading verification path")
+                if not order_id:
+                    # No order ID returned - this is a failure in live mode
+                    logger.error(f"[VERIFY] ❌ Live order placement failed - no order_id returned")
+                    return {
+                        'success': False,
+                        'error': "Order placement failed - no order ID returned from Coinbase",
+                        'order_id': None,
+                        'symbol': base_symbol,
+                        'action': trade_request.action,
+                        'size_usd': trade_request.size_usd,
+                        'mode': self.exec_mode.execution_mode
+                    }
+                
+                logger.info(f"[VERIFY] Starting verification for live order {order_id}")
+                verification_result = self.verify_order_completion(order_id)
+                
+                if verification_result['is_successful']:
+                    final_status = 'EXECUTED'
+                    logger.info(f"[VERIFY] ✅ Live order {order_id} verified as FILLED")
+                elif verification_result['is_final']:
+                    # Order failed or was rejected
+                    final_status = 'FAILED'
+                    failure_reason = verification_result.get('reject_reason', 'UNKNOWN')
+                    logger.error(f"[VERIFY] ❌ Live order {order_id} failed: {failure_reason}")
+                    
+                    # Return failure immediately for live trades that fail verification
+                    return {
+                        'success': False,
+                        'error': f"Order verification failed: {failure_reason}",
+                        'order_id': order_id,
+                        'symbol': base_symbol,
+                        'action': trade_request.action,
+                        'size_usd': trade_request.size_usd,
+                        'verification_result': verification_result,
+                        'mode': self.exec_mode.execution_mode
+                    }
+                else:
+                    # Order still pending - we'll record it but mark as pending
+                    final_status = 'PENDING'
+                    logger.warning(f"[VERIFY] ⏳ Live order {order_id} still pending after verification attempts")
+            else:
+                # Mock trading mode - always treat as executed immediately
+                logger.info(f"[DEBUG] Entering mock trading path")
+                final_status = 'EXECUTED'
+                logger.info(f"[MOCK] Order {order_id} treated as immediately filled")
+            
+            # Record the trade with fee information - ALWAYS use base symbol for database storage
+            trade_record = {
+                'order_id': order_id,
+                'symbol': base_symbol,  # Store base symbol, not the input format
+                'action': trade_request.action,
+                'size': position_size,
+                'price': current_price,
+                'size_usd': trade_request.size_usd,
+                'order_type': trade_request.order_type,
+                'timestamp': datetime.now(),
+                'status': final_status,
+                'estimated_fee': fee_info['estimated_fee'],
+                'total_cost': fee_info['total_cost']
+            }
+            
+            # Only save to database if trade was successful or if it's mock trading
+            if final_status in ['EXECUTED', 'PENDING']:
+                self.save_trade_record(trade_record, table_name=table_name)
+                
+                # Update statistics only for successful trades
+                if final_status == 'EXECUTED':
+                    self.daily_stats['trades_executed'] += 1
+                    self.daily_stats['total_volume'] += trade_request.size_usd
+                    self.risk_manager.record_trade(trade_record)
+                    
+                    # Invalidate portfolio cache after successful trade execution
+                    self.invalidate_portfolio_cache()
+                    logger.info("[PORTFOLIO_CACHE] ❌ Cache invalidated after successful trade execution")
+                
+                logger.info(f"[SUCCESS] {self.exec_mode.execution_mode.upper()} trade: {trade_request.action} ${trade_request.size_usd} {base_symbol} (Status: {final_status})")
+            else:
+                logger.error(f"[FAILED] {self.exec_mode.execution_mode.upper()} trade not saved: {trade_request.action} ${trade_request.size_usd} {base_symbol} (Status: {final_status})")
+            
+            # Send notification for trade result
+            notification_data = {
+                'symbol': base_symbol,
+                'action': trade_request.action,
+                'size_usd': trade_request.size_usd,
+                'price': current_price,
+                'order_id': order_id,
+                'status': 'SUCCESS' if final_status == 'EXECUTED' else 'FAILED',
+                'timestamp': datetime.now().isoformat()
+            }
+            send_trade_notification(notification_data)
+            
+            return {
+                'success': final_status == 'EXECUTED',
+                'order_id': order_id,
+                'symbol': base_symbol,  # Return base symbol for consistency
+                'action': trade_request.action,
+                'size_usd': trade_request.size_usd,
+                'price': current_price,
+                'position_size': position_size,
+                'mode': self.exec_mode.execution_mode,
+                'status': final_status,
+                'verification_result': verification_result,
+                'llm_validation': llm_validation,  # Include LLM validation results
+                'message': 'Trade executed successfully'
+            }
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Trade execution failed: {e}")
+            
+            # Send notification for trade error
+            notification_data = {
+                'symbol': normalize_symbol(trade_request.symbol) if trade_request.symbol else 'UNKNOWN',
+                'action': trade_request.action,
+                'size_usd': trade_request.size_usd,
+                'error': str(e),
+                'status': 'FAILED',
+                'timestamp': datetime.now().isoformat()
+            }
+            send_trade_notification(notification_data)
+            
+            return {
+                'success': False,
+                'error': str(e),
+                'symbol': normalize_symbol(trade_request.symbol) if trade_request.symbol else 'UNKNOWN',
+                'action': trade_request.action,
+                'size_usd': trade_request.size_usd
+            }
+    
+    def verify_order_completion(self, order_id: str, max_retries: int = 5, retry_delay: float = 2.0) -> Dict:
+        """
+        Verify that an order was actually filled on Coinbase
+        Returns order status information including completion status
+        """
+        for attempt in range(max_retries):
+            try:
+                order_details = self.coinbase_api.get_order_status(order_id)
+                
+                if not order_details:
+                    logger.warning(f"[VERIFY] No order details returned for {order_id}, attempt {attempt + 1}")
+                    time.sleep(retry_delay)
+                    continue
+                
+                status = order_details.get('status', '').upper()
+                completion_percentage = order_details.get('completion_percentage', '0')
+                filled_size = order_details.get('filled_size', '0')
+                settled = order_details.get('settled', False)
+                reject_reason = order_details.get('reject_reason', '')
+                reject_message = order_details.get('reject_message', '')
+                
+                logger.info(f"[VERIFY] Order {order_id} status: {status}, completion: {completion_percentage}%, filled: {filled_size}, settled: {settled}")
+                
+                # Coinbase Advanced Trade API possible statuses:
+                # PENDING, FILLED, CANCELLED, REJECTED, EXPIRED, QUEUED, CANCEL_PENDING
+                verification_result = {
+                    'order_id': order_id,
+                    'status': status,
+                    'completion_percentage': float(completion_percentage) if completion_percentage else 0.0,
+                    'filled_size': float(filled_size) if filled_size else 0.0,
+                    'settled': settled,
+                    'is_successful': False,
+                    'is_final': False,
+                    'reject_reason': reject_reason,
+                    'reject_message': reject_message,
+                    'raw_response': order_details
+                }
+                
+                # Determine if order is successful (completely filled)
+                if status == 'FILLED' and verification_result['completion_percentage'] >= 99.0:
+                    verification_result['is_successful'] = True
+                    verification_result['is_final'] = True
+                    logger.info(f"[VERIFY] ✅ Order {order_id} successfully FILLED")
+                    return verification_result
+                
+                # Determine if order failed permanently
+                elif status in ['CANCELLED', 'REJECTED', 'EXPIRED']:
+                    verification_result['is_final'] = True
+                    logger.warning(f"[VERIFY] ❌ Order {order_id} failed permanently: {status}")
+                    if reject_reason or reject_message:
+                        logger.warning(f"[VERIFY] Rejection details: {reject_reason} - {reject_message}")
+                    return verification_result
+                
+                # Order is still pending/processing
+                elif status in ['PENDING', 'QUEUED', 'CANCEL_PENDING']:
+                    logger.info(f"[VERIFY] ⏳ Order {order_id} still processing: {status}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        # Last attempt - return current status
+                        verification_result['is_final'] = False
+                        return verification_result
+                
+                # Partially filled - check if this is acceptable
+                elif status == 'FILLED' and verification_result['completion_percentage'] > 0:
+                    # Partially filled but not complete - treat as successful if > 95% filled
+                    if verification_result['completion_percentage'] >= 95.0:
+                        verification_result['is_successful'] = True
+                        verification_result['is_final'] = True
+                        logger.info(f"[VERIFY] ✅ Order {order_id} substantially filled ({verification_result['completion_percentage']:.1f}%)")
+                        return verification_result
+                    else:
+                        logger.warning(f"[VERIFY] ⚠️ Order {order_id} only partially filled ({verification_result['completion_percentage']:.1f}%)")
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            verification_result['is_final'] = True
+                            return verification_result
+                
+                else:
+                    logger.warning(f"[VERIFY] Unknown order status: {status} for order {order_id}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        verification_result['is_final'] = True
+                        return verification_result
+                        
+            except Exception as e:
+                logger.error(f"[VERIFY] Error checking order {order_id} status (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    # Final attempt failed
+                    return {
+                        'order_id': order_id,
+                        'status': 'UNKNOWN',
+                        'completion_percentage': 0.0,
+                        'filled_size': 0.0,
+                        'settled': False,
+                        'is_successful': False,
+                        'is_final': True,
+                        'error': str(e),
+                        'reject_reason': 'VERIFICATION_FAILED',
+                        'reject_message': f"Failed to verify order status: {e}"
+                    }
+        
+        # Should never reach here, but just in case
+        return {
+            'order_id': order_id,
+            'status': 'UNKNOWN',
+            'completion_percentage': 0.0,
+            'filled_size': 0.0,
+            'settled': False,
+            'is_successful': False,
+            'is_final': True,
+            'error': 'Max retries exceeded'
+        }
+
+    def update_pending_orders(self) -> Dict:
+        """
+        Check and update status of pending orders in the database
+        This should be called periodically to update orders that were initially pending
+        """
+        if not self.db_available:
+            return {'updated': 0, 'error': 'Database not available'}
+            
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor()
+            
+            # Get pending orders from the last 24 hours
+            cursor.execute("""
+                SELECT id, order_id, symbol, action, size_usd 
+                FROM trades 
+                WHERE status = 'PENDING' 
+                AND timestamp >= NOW() - INTERVAL 24 HOUR
+                AND order_id IS NOT NULL
+                ORDER BY timestamp DESC
+                LIMIT 50
+            """)
+            
+            pending_orders = cursor.fetchall()
+            updated_count = 0
+            
+            for order_record in pending_orders:
+                record_id, order_id, symbol, action, size_usd = order_record
+                
+                try:
+                    # Verify the order status
+                    verification_result = self.verify_order_completion(order_id, max_retries=2, retry_delay=1.0)
+                    
+                    new_status = None
+                    if verification_result['is_successful']:
+                        new_status = 'EXECUTED'
+                        logger.info(f"[UPDATE] Pending order {order_id} now FILLED")
+                    elif verification_result['is_final'] and not verification_result['is_successful']:
+                        new_status = 'FAILED'
+                        logger.info(f"[UPDATE] Pending order {order_id} now FAILED")
+                    
+                    # Update the database record if status changed
+                    if new_status:
+                        cursor.execute("""
+                            UPDATE trades 
+                            SET status = %s 
+                            WHERE id = %s
+                        """, (new_status, record_id))
+                        updated_count += 1
+                        
+                except Exception as e:
+                    logger.error(f"[UPDATE] Error updating pending order {order_id}: {e}")
+                    continue
+            
+            if updated_count > 0:
+                conn.commit()
+                logger.info(f"[UPDATE] Updated {updated_count} pending orders")
+            
+            cursor.close()
+            conn.close()
+            
+            return {
+                'success': True,
+                'updated': updated_count,
+                'total_checked': len(pending_orders)
+            }
+            
+        except Exception as e:
+            logger.error(f"[UPDATE] Error updating pending orders: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'updated': 0
+            }
+
+    def save_trade_record(self, trade_record: Dict, table_name: str = 'trades'):
+        """Save trade record to database"""
+        if not self.db_available:
+            logger.warning("[WARN] Skipping DB write (DB unavailable in mock mode)")
+            return
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor()
+            
+            # Create table if it doesn't exist (with fee tracking fields)
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    order_id VARCHAR(255),
+                    symbol VARCHAR(20) NOT NULL,
+                    action ENUM('BUY', 'SELL') NOT NULL,
+                    size DECIMAL(20,8) NOT NULL,
+                    price DECIMAL(20,8) NOT NULL,
+                    size_usd DECIMAL(20,2) NOT NULL,
+                    order_type VARCHAR(20) NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    status VARCHAR(20) NOT NULL,
+                    estimated_fee DECIMAL(20,4) DEFAULT 0.0000,
+                    total_cost DECIMAL(20,2) DEFAULT 0.00,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_symbol (symbol),
+                    INDEX idx_timestamp (timestamp),
+                    INDEX idx_order_id (order_id)
+                ) ENGINE=InnoDB
+            """)
+            
+            # Insert trade record with fee information
+            estimated_fee = trade_record.get('estimated_fee', 0.0)
+            total_cost = trade_record.get('total_cost', trade_record['size_usd'])
+            
+            cursor.execute(
+                f"""
+                INSERT INTO {table_name} (order_id, symbol, action, size, price, size_usd, order_type, timestamp, status, estimated_fee, total_cost)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    trade_record['order_id'],
+                    trade_record['symbol'],
+                    trade_record['action'],
+                    trade_record['size'],
+                    trade_record['price'],
+                    trade_record['size_usd'],
+                    trade_record['order_type'],
+                    trade_record['timestamp'],
+                    trade_record['status'],
+                    estimated_fee,
+                    total_cost
+                )
+            )
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.info(f"[SUCCESS] Trade record saved to database table {table_name}")
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to save trade record: {e}")
+    
+    def get_portfolio_status(self, force_fresh: bool = False) -> Dict:
+        """Get current portfolio status with intelligent caching strategy
+        
+        Args:
+            force_fresh (bool): If True, bypass cache for trading-critical operations
+        """
+        try:
+            current_time = time.time()
+            
+            # Use cache only for non-critical requests AND if cache is valid
+            use_cache = (not force_fresh and 
+                        self.portfolio_cache is not None and 
+                        self.portfolio_cache_timestamp is not None and
+                        current_time - self.portfolio_cache_timestamp < self.portfolio_cache_ttl)
+            
+            if use_cache:
+                logger.info(f"[PORTFOLIO_CACHE] ⚡ Returning cached data (age: {current_time - self.portfolio_cache_timestamp:.1f}s)")
+                return self.portfolio_cache
+            
+            cache_reason = "fresh data requested" if force_fresh else "cache miss/expired"
+            logger.info(f"[PORTFOLIO_CACHE] 🔄 Fetching live data ({cache_reason})")
+            
+            # Get fresh USD balance
+            usd_balance = self.coinbase_api.get_account_balance('USD')
+            
+            # Get fresh crypto positions
+            raw_positions = self.coinbase_api.get_positions()
+            
+            # Standardize position symbols
+            positions = SymbolStandardizer.standardize_portfolio_symbols(raw_positions)
+            
+            # Calculate total portfolio value with fresh prices
+            total_value = usd_balance
+            for position in positions:
+                # Get current price and calculate USD value using standardized symbols
+                base_symbol = "UNKNOWN"  # Default in case of early failure
+                try:
+                    # Handle balance field first - ensure it exists for all positions
+                    if 'balance' not in position:
+                        position['balance'] = position.get('available_balance', 0)
+                    
+                    symbol_field = 'currency' if 'currency' in position else 'symbol'
+                    base_symbol = position[symbol_field]
+                    coinbase_product_id = to_coinbase_format(base_symbol)
+                    
+                    balance = position['balance']
+                    
+                    # Get fresh price for accurate portfolio valuation
+                    price = self.coinbase_api.get_current_price(coinbase_product_id)
+                    position['current_price'] = price
+                    position['value_usd'] = balance * price
+                    total_value += position['value_usd']
+                    
+                    logger.debug(f"[PORTFOLIO] {base_symbol}: {balance} @ ${price} = ${position['value_usd']}")
+                except Exception as price_error:
+                    logger.warning(f"[PORTFOLIO] Failed to get price for {base_symbol}: {str(price_error)}")
+                    position['current_price'] = 0
+                    if 'balance' not in position:
+                        position['balance'] = position.get('available_balance', 0)
+                    position['value_usd'] = 0
+            
+            # Build portfolio response
+            portfolio_data = {
+                'usd_balance': usd_balance,
+                'total_portfolio_value': total_value,
+                'positions': positions,
+                'daily_stats': self.daily_stats,
+                'trading_enabled': self.is_trading_enabled if self.exec_mode.execution_mode == 'live' else True,
+                'mode': self.exec_mode.execution_mode,
+                'risk_limits': {
+                    'max_position_size_usd': float(self.config['MAX_POSITION_SIZE_USD']),
+                    'max_daily_trades': int(self.config['MAX_DAILY_TRADES']),
+                    'max_daily_loss_usd': float(self.config['MAX_DAILY_LOSS_USD'])
+                },
+                'cache_timestamp': current_time,
+                'data_freshness': 'live' if force_fresh else 'cached_allowed'
+            }
+            
+            # Always cache the fresh data (even for trading requests)
+            self.portfolio_cache = portfolio_data
+            self.portfolio_cache_timestamp = current_time
+            logger.info(f"[PORTFOLIO_CACHE] ✅ Updated cache with fresh data (TTL: {self.portfolio_cache_ttl}s)")
+            
+            return portfolio_data
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to get portfolio status: {e}")
+            return {'error': str(e)}
+    
+    def invalidate_portfolio_cache(self):
+        """Invalidate portfolio cache to force fresh data on next request"""
+        self.portfolio_cache = None
+        self.portfolio_cache_timestamp = None
+        logger.info("[PORTFOLIO_CACHE] ❌ Cache invalidated - next request will fetch fresh data")
+    
+    def process_recommendation(self, recommendation_id: int) -> Dict:
+        """Process a trade recommendation from the recommendation engine"""
+        try:
+            # Get recommendation from database
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor(dictionary=True)
+            
+            cursor.execute("""
+                SELECT * FROM trade_recommendations 
+                WHERE id = %s AND execution_status = 'PENDING'
+            """, (recommendation_id,))
+            
+            recommendation = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            if not recommendation:
+                return {'success': False, 'error': 'Recommendation not found or already processed'}
+            
+            # Convert recommendation to trade request
+            # Use the stored amount_usd directly instead of calculating from percentages
+            trade_size_usd = float(recommendation.get('amount_usd', 0.0))
+            
+            # If amount_usd is not available, fall back to percentage calculation
+            if trade_size_usd <= 0:
+                # position_size_percent is stored as percentage (e.g., 0.5 for 0.5%), so divide by 100
+                position_percentage = float(recommendation.get('position_size_percent', 2.0)) / 100.0
+                
+                # Calculate trade size based on action type
+                if recommendation['signal_type'] == 'SELL':
+                    # For SELL orders, use the position value of the asset being sold
+                    symbol = recommendation['symbol']
+                    position_value = self.coinbase_api.get_position_value(symbol)
+                    if position_value <= 0:
+                        logger.warning(f"[!] No position found for {symbol} to sell")
+                        return {'success': False, 'error': f'No position found for {symbol}'}
+                    trade_size_usd = position_percentage * position_value
+                else:
+                    # For BUY orders, use USD balance
+                    trade_size_usd = position_percentage * self.coinbase_api.get_account_balance('USD')
+            
+            logger.info(f"[TRADE_SIZE] {recommendation['symbol']} {recommendation['signal_type']}: stored_amount=${recommendation.get('amount_usd', 0.0)} calculated_amount=${trade_size_usd:.2f}")
+            
+            # Enforce minimum trade amount
+            min_trade_amount = float(self.config.get('MIN_TRADE_SIZE_USD', 10.0))
+            # Minimum position value to allow liquidation (prevent tiny trades)
+            min_liquidation_value = float(self.config.get('MIN_LIQUIDATION_VALUE_USD', 5.0))
+            
+            if trade_size_usd < min_trade_amount:
+                if recommendation['signal_type'] == 'SELL':
+                    # For SELL, if position is smaller than minimum, check if it's worth liquidating
+                    symbol = recommendation['symbol']
+                    position_value = self.coinbase_api.get_position_value(symbol)
+                    
+                    if position_value >= min_liquidation_value:
+                        logger.info(f"[LIQUIDATE] {symbol} position (${position_value:.2f}) above liquidation threshold (${min_liquidation_value}), selling entire position")
+                        trade_size_usd = position_value
+                    else:
+                        logger.warning(f"[SKIP] {symbol} position (${position_value:.2f}) too small for liquidation (min ${min_liquidation_value})")
+                        return {'success': False, 'error': f'Position value ${position_value:.2f} too small for liquidation (min ${min_liquidation_value})'}
+                else:
+                    logger.warning(f"[SKIP] {recommendation['symbol']} trade size (${trade_size_usd:.2f}) below minimum (${min_trade_amount})")
+                    return {'success': False, 'error': f'Trade size ${trade_size_usd:.2f} below minimum ${min_trade_amount}'}
+            
+            trade_request = TradeRequest(
+                symbol=recommendation['symbol'],
+                action=recommendation['signal_type'],
+                size_usd=trade_size_usd,
+                order_type='MARKET'
+            )
+            
+            # Execute the trade
+            result = self.execute_trade(trade_request)
+            
+            # Update recommendation status
+            if result['success']:
+                self.update_recommendation_status(recommendation_id, 'EXECUTED', result.get('order_id'))
+            else:
+                self.update_recommendation_status(recommendation_id, 'REJECTED', error=result.get('error'))
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to process recommendation: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def update_recommendation_status(self, recommendation_id: int, status: str, order_id: str = None, error: str = None):
+        """Update recommendation status in database"""
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                UPDATE trade_recommendations 
+                SET execution_status = %s, executed_at = %s, execution_notes = %s
+                WHERE id = %s
+            """, (status, datetime.now(), error or order_id, recommendation_id))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to update recommendation status: {e}")
+
+# FastAPI application
+app = FastAPI(title="Live Trading Engine", version="1.0.0")
+
+# Add CORS middleware for frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global trading engine instance
+trading_engine = None
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize trade execution engine on startup"""
+    global trading_engine
+    try:
+        trading_engine = TradeExecutionEngine()
+        logger.info("[+] Trade Execution Engine started successfully")
+    except Exception as e:
+        logger.error(f"[!] Failed to start trade execution engine: {e}")
+        raise
+
+class TradeRequestModel(BaseModel):
+    symbol: str
+    action: str
+    size_usd: float
+    order_type: str = "MARKET"
+    limit_price: Optional[float] = None
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "trade_execution_engine",
+        "trading_enabled": trading_engine.is_trading_enabled if trading_engine else False,
+        "mode": trading_engine.exec_mode.execution_mode if trading_engine else "unknown",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/status")
+async def get_status():
+    """Get detailed service status"""
+    if not trading_engine:
+        return {
+            "status": "error",
+            "service": "trade_execution_engine",
+            "error": "Trading engine not initialized",
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    try:
+        # Get portfolio status for additional context
+        portfolio_status = trading_engine.get_portfolio_status()
+        
+        return {
+            "status": "operational",
+            "service": "trade_execution_engine",
+            "version": "1.0.0",
+            "mode": trading_engine.exec_mode.execution_mode,
+            "trading_enabled": trading_engine.is_trading_enabled,
+            "portfolio": {
+                "total_value_usd": portfolio_status.get('total_value_usd', 0),
+                "positions_count": len(portfolio_status.get('positions', {})),
+                "last_updated": portfolio_status.get('last_updated')
+            },
+            "database_connected": True,  # If we get here, DB connection is working
+            "coinbase_connected": trading_engine.exec_mode.execution_mode == "live",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Status check failed: {e}")
+        return {
+            "status": "degraded",
+            "service": "trade_execution_engine",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+@app.get("/metrics")
+async def get_metrics():
+    """Get service metrics"""
+    if not trading_engine:
+        return {
+            "error": "Trading engine not initialized",
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    try:
+        # Get portfolio metrics
+        portfolio_status = trading_engine.get_portfolio_status()
+        positions = portfolio_status.get('positions', {})
+        
+        # Calculate basic metrics
+        total_value = portfolio_status.get('total_value_usd', 0)
+        positions_count = len(positions)
+        
+        # Get recent trades count (last 24 hours)
+        with trading_engine.get_db_connection() as conn:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT COUNT(*) as recent_trades
+                FROM trades 
+                WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+            """)
+            recent_trades = cursor.fetchone()['recent_trades']
+            
+            # Get pending recommendations count
+            cursor.execute("""
+                SELECT COUNT(*) as pending_recommendations
+                FROM trade_recommendations 
+                WHERE execution_status = 'PENDING'
+            """)
+            pending_recs = cursor.fetchone()['pending_recommendations']
+        
+        return {
+            "service": "trade_execution_engine",
+            "metrics": {
+                "portfolio_value_usd": total_value,
+                "active_positions": positions_count,
+                "trades_24h": recent_trades,
+                "pending_recommendations": pending_recs,
+                "trading_enabled": trading_engine.is_trading_enabled,
+                "execution_mode": trading_engine.exec_mode.execution_mode,
+                "uptime_seconds": (datetime.now() - datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds()
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Metrics collection failed: {e}")
+        return {
+            "error": f"Metrics collection failed: {e}",
+            "timestamp": datetime.now().isoformat()
+        }
+
+@app.get("/portfolio")
+async def get_portfolio(fresh: bool = False):
+    """Get current portfolio status
+    
+    Args:
+        fresh (bool): If True, bypass cache and get fresh data for trading decisions
+                     If False, allow cached data for dashboard/monitoring
+    """
+    if not trading_engine:
+        raise HTTPException(status_code=500, detail="Trading engine not initialized")
+    
+    return trading_engine.get_portfolio_status(force_fresh=fresh)
+
+@app.get("/balance")
+async def get_balance():
+    """Get current USD balance"""
+    if not trading_engine:
+        raise HTTPException(status_code=500, detail="Trading engine not initialized")
+    
+    try:
+        if trading_engine.exec_mode.execution_mode == "live":
+            balance = trading_engine.coinbase_api.get_account_balance('USD')
+            return {"balance": balance, "currency": "USD", "mode": "live"}
+        else:
+            # Mock mode - return a mock balance
+            return {"balance": 1000.0, "currency": "USD", "mode": "mock"}
+    except Exception as e:
+        logger.error(f"Failed to get balance: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get balance: {e}")
+
+@app.post("/execute_trade")
+async def execute_trade(trade_request: TradeRequestModel):
+    """Execute a trade (live or mock)"""
+    if not trading_engine:
+        raise HTTPException(status_code=500, detail="Trading engine not initialized")
+    
+    trade_req = TradeRequest(
+        symbol=trade_request.symbol,
+        action=trade_request.action,
+        size_usd=trade_request.size_usd,
+        order_type=trade_request.order_type,
+        limit_price=trade_request.limit_price
+    )
+    
+    return trading_engine.execute_trade(trade_req)
+
+@app.post("/process_recommendation/{recommendation_id}")
+async def process_recommendation(recommendation_id: int):
+    """Process a trade recommendation"""
+    if not trading_engine:
+        raise HTTPException(status_code=500, detail="Trading engine not initialized")
+    
+    return trading_engine.process_recommendation(recommendation_id)
+
+@app.post("/toggle_trading")
+async def toggle_trading():
+    """Toggle live trading on/off (live mode only)"""
+    if not trading_engine:
+        raise HTTPException(status_code=500, detail="Trading engine not initialized")
+    
+    trading_engine.is_trading_enabled = not trading_engine.is_trading_enabled
+    status = "enabled" if trading_engine.is_trading_enabled else "disabled"
+    
+    logger.info(f"[STATUS] Live trading {status}")
+    
+    return {
+        "trading_enabled": trading_engine.is_trading_enabled,
+        "mode": trading_engine.exec_mode.execution_mode,
+        "message": f"Live trading {status}"
+    }
+
+@app.post("/set_mode/{mode}")
+async def set_mode(mode: str):
+    """Set execution mode to 'live' or 'mock' (runtime switch)."""
+    if mode.lower() not in ("live", "mock"):
+        raise HTTPException(status_code=400, detail="mode must be 'live' or 'mock'")
+    
+    global trading_engine
+    # Reinitialize engine to ensure clean state
+    os.environ['EXECUTION_MODE'] = mode.lower()
+    trading_engine = TradeExecutionEngine()
+    return {"mode": trading_engine.exec_mode.execution_mode}
+
+@app.post("/update_pending_orders")
+async def update_pending_orders():
+    """Update status of pending orders from Coinbase"""
+    if not trading_engine:
+        raise HTTPException(status_code=500, detail="Trading engine not initialized")
+    
+    try:
+        if trading_engine.exec_mode.execution_mode != "live":
+            return {
+                "message": "Pending order updates only available in live mode",
+                "mode": trading_engine.exec_mode.execution_mode,
+                "timestamp": datetime.now().isoformat()
+            }
+        
+        result = trading_engine.update_pending_orders()
+        return {
+            "message": "Pending orders update completed",
+            "result": result,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Failed to update pending orders: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update pending orders: {e}")
+
+if __name__ == "__main__":
+    # Start the FastAPI server
+    port = int(os.getenv('TRADE_EXECUTION_PORT', 8024))
+    uvicorn.run(app, host="0.0.0.0", port=port)

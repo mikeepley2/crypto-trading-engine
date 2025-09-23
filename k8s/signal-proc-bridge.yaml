@@ -1,0 +1,151 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: signal-proc-bridge-config
+  namespace: crypto-trading
+  labels:
+    app: signal-proc-bridge
+    category: signal-processing
+    component: bridge
+data:
+  # Database Configuration
+  DATABASE_HOST: "host.docker.internal"
+  DATABASE_USER: "news_collector"
+  SIGNALS_DATABASE: "crypto_prices"
+  TRADES_DATABASE: "crypto_transactions"
+  
+  # Redis Configuration
+  REDIS_HOST: "infra-redis"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+  REDIS_ENABLED: "true"
+  
+  # Trading Configuration  
+  TRADE_EXECUTION_URL: "http://trade-exec-coinbase:8024"
+  FALLBACK_INTERVAL_SECONDS: "60"
+  MAX_SIGNAL_AGE_MINUTES: "10"
+  
+  # Risk Management - ENHANCED SETTINGS TO REDUCE EXCESSIVE TRADING
+  MAX_POSITION_SIZE_USD: "500"
+  MAX_DAILY_TRADES: "50"  # Reduced from 300 to 50 to prevent excessive trading
+  BALANCE_UTILIZATION_PERCENT: "95"
+  MIN_TRADE_SIZE_USD: "25.00"  # Increased from $5 to $25 to reduce micro-trades
+  MIN_COINBASE_TRADE_AMOUNT: "1.00"
+  MIN_POSITION_VALUE_USD: "25.00"  # Increased to match minimum trade size
+  MIN_CONFIDENCE_THRESHOLD: "0.75"  # Added 75% minimum confidence requirement
+  
+  # K8s Service Integration
+  KUBERNETES_SIGNAL_SERVICES: "true"
+  SIGNAL_DATABASE_ONLY: "true"
+  
+  # Notification Configuration
+  ENABLE_NOTIFICATIONS: "true"
+  NOTIFICATION_SERVICE_URL: "http://notification-service.crypto-monitoring.svc.cluster.local:8038"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: signal-proc-bridge-secrets
+  namespace: crypto-trading
+  labels:
+    app: signal-proc-bridge
+    category: signal-processing
+    component: bridge
+type: Opaque
+stringData:
+  DATABASE_PASSWORD: "99Rules!"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-proc-bridge
+  namespace: crypto-trading
+  labels:
+    app: signal-proc-bridge
+    category: signal-processing
+    component: bridge
+    version: v1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-proc-bridge
+  template:
+    metadata:
+      labels:
+        app: signal-proc-bridge
+        category: signal-processing
+        component: bridge
+        version: v1
+    spec:
+      containers:
+      - name: signal-proc-bridge
+        image: aitest-enhanced-signal-bridge:v7-asset-fix
+        imagePullPolicy: Never  # For local development
+        ports:
+        - containerPort: 8022
+          name: http
+          protocol: TCP
+        env:
+        - name: DATABASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: signal-proc-bridge-secrets
+              key: DATABASE_PASSWORD
+        envFrom:
+        - configMapRef:
+            name: signal-proc-bridge-config
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8022
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8022
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: logs
+        emptyDir: {}
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-proc-bridge
+  namespace: crypto-trading
+  labels:
+    app: signal-proc-bridge
+    category: signal-processing
+    component: bridge
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8022
+    targetPort: 8022
+    protocol: TCP
+    name: http
+  selector:
+    app: signal-proc-bridge

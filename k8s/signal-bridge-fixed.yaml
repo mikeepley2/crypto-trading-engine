@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-bridge-fixed
+  namespace: crypto-trading
+  labels:
+    app: signal-bridge-fixed
+    component: signal-processing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-bridge-fixed
+  template:
+    metadata:
+      labels:
+        app: signal-bridge-fixed
+        component: signal-processing
+    spec:
+      containers:
+      - name: signal-bridge
+        image: aitest-enhanced-signal-bridge:v7-asset-fix
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: DATABASE_HOST
+          value: "host.docker.internal"
+        - name: DATABASE_USER
+          value: "news_collector"
+        - name: DATABASE_PASSWORD
+          value: "99Rules!"
+        - name: DATABASE_NAME
+          value: "crypto_transactions"
+        - name: TRADE_EXECUTION_URL
+          value: "http://trade-exec-coinbase:8024"
+        - name: BRIDGE_INTERVAL_SECONDS
+          value: "60"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: RISK_MANAGEMENT_URL
+          value: "http://advanced-risk-service.crypto-trading.svc.cluster.local:8027"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-bridge-fixed
+  namespace: crypto-trading
+  labels:
+    app: signal-bridge-fixed
+spec:
+  selector:
+    app: signal-bridge-fixed
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  type: ClusterIP

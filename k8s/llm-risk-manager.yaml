@@ -1,0 +1,145 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-risk-manager
+  namespace: crypto-trading
+  labels:
+    app: llm-risk-manager
+    component: risk-management
+    version: v1.0.0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-risk-manager
+  template:
+    metadata:
+      labels:
+        app: llm-risk-manager
+        component: risk-management
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8034"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: llm-risk-manager
+        image: aitest-llm-risk-manager:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8034
+          name: http
+        - containerPort: 9091
+          name: metrics
+        env:
+        - name: DATABASE_HOST
+          value: "host.docker.internal"
+        - name: DATABASE_USER
+          value: "news_collector"
+        - name: DATABASE_PASSWORD
+          value: "99Rules!"
+        - name: DATABASE_NAME
+          value: "crypto_prices"
+        - name: TRADING_DATABASE_NAME
+          value: "crypto_transactions"
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: openai-api-key
+              key: OPENAI_API_KEY
+        - name: XAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: xai-api-key
+              key: XAI_API_KEY
+              optional: true
+        - name: METRICS_PORT
+          value: "9091"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: PROMETHEUS_METRICS_ENABLED
+          value: "true"
+        - name: MAX_POSITION_SIZE_USD
+          value: "500"
+        - name: DEFAULT_STOP_LOSS_PERCENT
+          value: "0.03"
+        - name: RISK_ASSESSMENT_INTERVAL
+          value: "300"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8034
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8034
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8034
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-risk-manager
+  namespace: crypto-trading
+  labels:
+    app: llm-risk-manager
+    component: risk-management
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9091"
+    prometheus.io/path: "/metrics"
+spec:
+  selector:
+    app: llm-risk-manager
+  ports:
+  - name: http
+    port: 8034
+    targetPort: 8034
+    protocol: TCP
+  - name: metrics
+    port: 9091
+    targetPort: 9091
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openai-api-key
+  namespace: crypto-trading
+type: Opaque
+data:
+  # Base64 encoded OpenAI API key - update this with your actual key
+  api-key: ""
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: xai-api-key
+  namespace: crypto-trading
+type: Opaque
+data:
+  # Base64 encoded XAI API key - update this with your actual key
+  api-key: ""

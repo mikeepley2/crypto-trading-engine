@@ -1,0 +1,32 @@
+# Dockerfile for ML Integration Service
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python dependencies
+COPY ml/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the ML integration service code
+COPY ml/ .
+COPY shared/ ./shared/
+
+# Create directory for ML models
+RUN mkdir -p /app/ml_models_optimized
+
+# Expose port
+EXPOSE 8024
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8024/health || exit 1
+
+# Run the ML integration service
+CMD ["python", "ml_integration_service.py"]

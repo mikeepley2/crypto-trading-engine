@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""
+Enhanced Signal Bridge Service with Real-Time Redis Streaming
+Combines Redis real-time streaming with database fallback for optimal performance
+"""
+
+import os
+import sys
+import time
+import logging
+import threading
+import signal as unix_signal
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+\1from backend.shared.database_connection_manager import db_manager, get_db_connection, get_db_cursor, execute_query
+import redis
+import requests
+from redis_signal_subscriber import RedisSignalSubscriber, RealTimeSignalBridge
+from fastapi import FastAPI
+import uvicorn
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [ENHANCED_BRIDGE] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class EnhancedSignalBridge(RealTimeSignalBridge):
+    """Enhanced signal bridge with Redis streaming + database fallback"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        # Configuration
+        self.redis_enabled = os.environ.get('REDIS_ENABLED', 'true').lower() == 'true'
+        self.fallback_interval = int(os.environ.get('FALLBACK_INTERVAL_SECONDS', 60))
+        self.max_signal_age = int(os.environ.get('MAX_SIGNAL_AGE_MINUTES', 10))
+        
+        # Thread management
+        self.fallback_thread = None
+        self.running = False
+        
+        # Metrics
+        self.redis_signals_processed = 0
+        self.fallback_signals_processed = 0
+        self.total_recommendations_created = 0
+        self.start_time = datetime.utcnow()
+        
+        # Signal deduplication
+        self.processed_signals = set()
+        self.processed_signals_cleanup_interval = 300  # 5 minutes
+        self.last_cleanup = datetime.utcnow()
+        
+    def is_signal_duplicate(self, signal_id: str) -> bool:
+        """Check if signal has already been processed"""
+        return signal_id in self.processed_signals
+    
+    def mark_signal_processed(self, signal_id: str):
+        """Mark signal as processed"""
+        self.processed_signals.add(signal_id)
+    
+    def cleanup_processed_signals(self):
+        """Clean up old processed signals to prevent memory growth"""
+        current_time = datetime.utcnow()
+        if (current_time - self.last_cleanup).total_seconds() > self.processed_signals_cleanup_interval:
+            # Keep only recent signals (last hour)
+            # In practice, we'd need timestamps for signals, but this is a simple approach
+            if len(self.processed_signals) > 10000:
+                # Clear half of the processed signals if too many
+                signals_list = list(self.processed_signals)
+                self.processed_signals = set(signals_list[len(signals_list)//2:])
+                logger.info(f"🧹 Cleaned up processed signals cache (kept {len(self.processed_signals)})")
+            
+            self.last_cleanup = current_time
+    
+    def process_real_time_signal(self, signal: Dict) -> bool:
+        """Enhanced real-time signal processing with deduplication"""
+        try:
+            signal_id = signal.get('signal_id')
+            if not signal_id:
+                logger.warning("⚠️ Signal missing signal_id, skipping")
+                return False
+            
+            # Check for duplicates
+            if self.is_signal_duplicate(signal_id):
+                logger.debug(f"🔄 Duplicate signal {signal_id}, skipping")
+                return True
+            
+            # Process signal
+            success = super().process_real_time_signal(signal)
+            
+            if success:
+                self.mark_signal_processed(signal_id)
+                self.redis_signals_processed += 1
+                logger.info(f"⚡ Processed real-time signal {signal_id} for {signal['symbol']}")
+            
+            # Cleanup processed signals periodically
+            self.cleanup_processed_signals()
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ Enhanced real-time signal processing error: {e}")
+            return False
+    
+    def get_unprocessed_signals_from_db(self) -> List[Dict]:
+        """Get unprocessed signals from database (fallback)"""
+        try:
+            conn = db_manager.get_connection('crypto_prices')
+            cursor = conn.cursor(dictionary=True)
+            
+            # Get recent signals that haven't been processed (using database time)
+            query = """
+            SELECT signal_id, symbol, signal_type, confidence, price, 
+                   model_version, signal_strength, timestamp, 
+                   TIMESTAMPDIFF(SECOND, timestamp, NOW()) as age_seconds
+            FROM trading_signals 
+            WHERE TIMESTAMPDIFF(MINUTE, timestamp, NOW()) <= %s
+              AND confidence >= 0.7
+              AND processed_at IS NULL
+            ORDER BY timestamp DESC, confidence DESC
+            LIMIT 100
+            """
+            
+            cursor.execute(query, (self.max_signal_age,))
+            signals = cursor.fetchall()
+            
+            cursor.close()
+            conn.close()
+            
+            logger.debug(f"📊 Found {len(signals)} unprocessed signals in database")
+            return signals
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting signals from database: {e}")
+            return []
+    
+    def mark_signal_processed_in_db(self, signal_id: str):
+        """Mark signal as processed in database"""
+        try:
+            conn = db_manager.get_connection('crypto_prices')
+            cursor = conn.cursor()
+            
+            query = "UPDATE trading_signals SET processed_at = NOW() WHERE signal_id = %s"
+            cursor.execute(query, (signal_id,))
+            conn.commit()
+            
+            cursor.close()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"❌ Error marking signal as processed: {e}")
+    
+    def _redis_listener_worker(self):
+        """Worker thread for Redis listening (NON-BLOCKING)"""
+        logger.info("🎧 Redis listener worker started")
+        try:
+            # Call the blocking Redis listener in this separate thread
+            self.redis_subscriber.start_listening()
+        except Exception as e:
+            logger.error(f"❌ Redis listener error: {e}")
+        logger.info("🛑 Redis listener worker stopped")
+
+    def fallback_processor_worker(self):
+        """Worker thread for database fallback processing"""
+        logger.info("🔄 Fallback processor worker started")
+        
+        while self.running:
+            try:
+                # Get unprocessed signals
+                signals = self.get_unprocessed_signals_from_db()
+                
+                for signal in signals:
+                    if not self.running:
+                        break
+                    
+                    signal_id = signal['signal_id']
+                    
+                    # Check if already processed via Redis
+                    if self.is_signal_duplicate(signal_id):
+                        # Mark as processed in DB but don't create recommendation
+                        self.mark_signal_processed_in_db(signal_id)
+                        continue
+                    
+                    # Convert timestamp to string for processing
+                    signal['timestamp'] = signal['timestamp'].isoformat()
+                    
+                    # Process signal
+                    recommendation = self.convert_signal_to_recommendation(signal)
+                    
+                    if recommendation:
+                        rec_id = self.save_recommendation(recommendation)
+                        if rec_id:
+                            self.mark_signal_processed(signal_id)
+                            self.mark_signal_processed_in_db(signal_id)
+                            self.fallback_signals_processed += 1
+                            self.total_recommendations_created += 1
+                            
+                            logger.info(f"🔄 Fallback processed signal {signal_id} for {signal['symbol']} "
+                                       f"(rec: {rec_id})")
+                
+                # Wait before next fallback check
+                time.sleep(self.fallback_interval)
+                
+            except Exception as e:
+                logger.error(f"❌ Error in fallback processor: {e}")
+                time.sleep(10)  # Wait longer on error
+        
+        logger.info("🛑 Fallback processor worker stopped")
+    
+    def start_enhanced_bridge(self):
+        """Start the enhanced signal bridge with Redis + fallback"""
+        logger.info("🚀 Starting Enhanced Signal Bridge...")
+        logger.info(f"   Redis enabled: {self.redis_enabled}")
+        logger.info(f"   Fallback interval: {self.fallback_interval}s")
+        logger.info(f"   Max signal age: {self.max_signal_age}m")
+        
+        self.running = True
+        
+        # Start fallback processor thread
+        self.fallback_thread = threading.Thread(
+            target=self.fallback_processor_worker,
+            daemon=True
+        )
+        self.fallback_thread.start()
+        
+        if self.redis_enabled:
+            try:
+                # Start Redis subscriber in separate thread to avoid blocking
+                logger.info("🎧 Starting Redis real-time subscriber...")
+                self.redis_thread = threading.Thread(
+                    target=self._redis_listener_worker,
+                    name="RedisListener",
+                    daemon=True
+                )
+                self.redis_thread.start()
+                logger.info("✅ Redis listener thread started")
+            except Exception as e:
+                logger.error(f"❌ Redis subscriber error: {e}")
+                logger.info("🔄 Falling back to database-only mode...")
+        
+        # Always wait for shutdown regardless of Redis mode
+        logger.info("📊 Bridge running, waiting for shutdown signal...")
+        self.wait_for_shutdown()
+    
+    def wait_for_shutdown(self):
+        """Wait for shutdown signal"""
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("🛑 Shutdown signal received")
+            self.stop_bridge()
+    
+    def stop_bridge(self):
+        """Stop the enhanced bridge"""
+        logger.info("🛑 Stopping Enhanced Signal Bridge...")
+        
+        self.running = False
+        
+        if self.redis_enabled and hasattr(self, 'redis_subscriber'):
+            self.redis_subscriber.stop_listening()
+        
+        # Wait for Redis thread to finish
+        if hasattr(self, 'redis_thread') and self.redis_thread.is_alive():
+            self.redis_thread.join(timeout=5)
+        
+        # Wait for fallback thread to finish
+        if self.fallback_thread and self.fallback_thread.is_alive():
+            self.fallback_thread.join(timeout=5)
+        
+        logger.info("✅ Enhanced Signal Bridge stopped")
+    
+    def get_bridge_metrics(self) -> Dict:
+        """Get comprehensive bridge metrics"""
+        uptime = (datetime.utcnow() - self.start_time).total_seconds()
+        
+        base_metrics = {
+            'redis_signals_processed': self.redis_signals_processed,
+            'fallback_signals_processed': self.fallback_signals_processed,
+            'total_recommendations_created': self.total_recommendations_created,
+            'processed_signals_cache_size': len(self.processed_signals),
+            'uptime_seconds': uptime,
+            'running': self.running,
+            'redis_enabled': self.redis_enabled,
+            'fallback_interval': self.fallback_interval,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        # Add Redis metrics if available
+        if self.redis_enabled and hasattr(self, 'redis_subscriber'):
+            redis_metrics = self.redis_subscriber.get_metrics()
+            base_metrics.update({
+                'redis_' + k: v for k, v in redis_metrics.items()
+            })
+        
+        return base_metrics
+
+# FastAPI app for health checks and metrics
+app = FastAPI(title="Enhanced Signal Bridge", version="1.0.0")
+
+# Global bridge instance
+bridge_instance = None
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    if bridge_instance and bridge_instance.running:
+        return {
+            "status": "healthy",
+            "service": "enhanced_signal_bridge",
+            "timestamp": datetime.utcnow().isoformat(),
+            "redis_enabled": bridge_instance.redis_enabled,
+            "running": bridge_instance.running
+        }
+    return {"status": "unhealthy", "reason": "service not running"}
+
+@app.get("/metrics")
+async def get_metrics():
+    """Get bridge metrics"""
+    if bridge_instance:
+        return bridge_instance.get_bridge_metrics()
+    return {"error": "service not initialized"}
+
+def run_api_server():
+    """Run FastAPI server in separate thread"""
+    uvicorn.run(app, host="0.0.0.0", port=8022, log_level="warning")
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    logger.info(f"🛑 Received signal {signum}, shutting down...")
+    # This will be caught by the main loop
+    raise KeyboardInterrupt()
+
+def main():
+    """Main function"""
+    global bridge_instance
+    
+    # Set up signal handlers
+    unix_signal.signal(unix_signal.SIGINT, signal_handler)
+    unix_signal.signal(unix_signal.SIGTERM, signal_handler)
+    
+    # Start API server in separate thread
+    api_thread = threading.Thread(target=run_api_server, daemon=True)
+    api_thread.start()
+    
+    # Create and start enhanced bridge
+    bridge_instance = EnhancedSignalBridge()
+    
+    try:
+        bridge_instance.start_enhanced_bridge()
+    except KeyboardInterrupt:
+        logger.info("🛑 Shutdown requested")
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}")
+        return 1
+    finally:
+        if bridge_instance:
+            bridge_instance.stop_bridge()
+    
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

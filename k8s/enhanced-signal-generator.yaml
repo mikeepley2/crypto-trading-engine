@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enhanced-signal-generator
+  namespace: crypto-trading
+  labels:
+    app: enhanced-signal-generator
+    component: signal-generation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: enhanced-signal-generator
+  template:
+    metadata:
+      labels:
+        app: enhanced-signal-generator
+        component: signal-generation
+    spec:
+      containers:
+      - name: enhanced-signal-generator
+        image: aitest-enhanced-signal-generator:v4-full-asset-coverage
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8025
+          name: http
+        env:
+        - name: DB_HOST
+          value: "192.168.230.163"
+        - name: DB_USER
+          value: "news_collector"
+        - name: DB_PASSWORD
+          value: "99Rules!"
+        - name: DB_NAME
+          value: "crypto_prices"
+        - name: REDIS_HOST
+          value: "infra-redis"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: SIGNAL_GENERATION_INTERVAL
+          value: "900"  # 15 minutes for full asset coverage
+        - name: MARKET_HOURS_INTERVAL
+          value: "900"  # 15 minutes during active hours
+        - name: QUIET_HOURS_INTERVAL
+          value: "1800"  # 30 minutes during quiet hours
+        - name: SIGNAL_BATCH_SIZE
+          value: "25"  # Process 25 assets per batch
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8025
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8025
+          initialDelaySeconds: 10
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: enhanced-signal-generator
+  namespace: crypto-trading
+  labels:
+    app: enhanced-signal-generator
+    component: signal-generation
+spec:
+  selector:
+    app: enhanced-signal-generator
+  ports:
+  - port: 8025
+    targetPort: 8025
+    protocol: TCP
+    name: http
+  type: ClusterIP

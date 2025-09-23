@@ -1,0 +1,95 @@
+# Enhanced Trading Engine V2 Requirements
+# Core dependencies for unified trading engine with legacy functionality and LLM integration
+
+# Core Python packages
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# XGBoost for ML models
+xgboost>=1.7.0
+
+# Database connectivity
+mysql-connector-python>=8.0.33
+PyMySQL>=1.1.0
+SQLAlchemy>=2.0.0
+
+# Web framework and API
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.0.0
+starlette>=0.27.0
+
+# HTTP requests
+requests>=2.31.0
+aiohttp>=3.8.0
+httpx>=0.24.0
+
+# Data processing
+scipy>=1.11.0
+ta>=0.10.2
+yfinance>=0.2.18
+
+# Real-time data APIs
+ccxt>=4.0.0
+websockets>=11.0.0
+
+# LLM and AI integration
+openai>=1.0.0
+tiktoken>=0.5.0
+
+# Async processing
+asyncio-mqtt>=0.14.0
+aiofiles>=23.0.0
+
+# Configuration and environment
+python-dotenv>=1.0.0
+pyyaml>=6.0.0
+toml>=0.10.2
+
+# Logging and monitoring
+structlog>=23.0.0
+prometheus-client>=0.17.0
+
+# Date and time handling
+python-dateutil>=2.8.2
+pytz>=2023.3
+
+# Caching and Redis
+redis>=4.6.0
+aioredis>=2.0.0
+
+# Data validation
+marshmallow>=3.20.0
+cerberus>=1.3.5
+
+# Performance optimization
+numba>=0.57.0
+bottleneck>=1.3.7
+
+# Testing (for development)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-mock>=3.11.0
+
+# Development utilities
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0
+
+# Security
+cryptography>=41.0.0
+bcrypt>=4.0.0
+
+# Utilities
+click>=8.1.0
+tqdm>=4.66.0
+colorama>=0.4.6
+
+# Financial calculations
+quantlib>=1.31
+empyrical>=0.5.5
+
+# Alternative HTTP client
+curl-cffi>=0.5.0

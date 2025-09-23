@@ -1,0 +1,208 @@
+{
+  "folders": [
+    {
+      "name": "Crypto Trading Engine",
+      "path": "."
+    }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "./venv/bin/python",
+    "python.linting.enabled": true,
+    "python.linting.pylintEnabled": true,
+    "python.linting.flake8Enabled": true,
+    "python.formatting.provider": "black",
+    "python.sortImports.args": ["--profile", "black"],
+    "python.testing.pytestEnabled": true,
+    "python.testing.pytestArgs": ["tests"],
+    "files.associations": {
+      "*.yaml": "yaml",
+      "*.yml": "yaml",
+      "Dockerfile*": "dockerfile"
+    },
+    "yaml.schemas": {
+      "kubernetes": ["k8s/*.yaml", "k8s/*.yml"]
+    },
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit"
+    },
+    "files.exclude": {
+      "**/__pycache__": true,
+      "**/*.pyc": true,
+      "**/.pytest_cache": true,
+      "**/node_modules": true,
+      "**/.git": false
+    },
+    "search.exclude": {
+      "**/logs": true,
+      "**/venv": true,
+      "**/.pytest_cache": true
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-python.python",
+      "ms-python.flake8",
+      "ms-python.black-formatter",
+      "ms-kubernetes-tools.vscode-kubernetes-tools",
+      "redhat.vscode-yaml",
+      "ms-vscode.vscode-json",
+      "ms-vscode-remote.remote-containers",
+      "github.copilot",
+      "ms-python.pylint"
+    ]
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "Deploy Trading Engine",
+        "type": "shell",
+        "command": "kubectl",
+        "args": ["apply", "-f", "k8s/"],
+        "group": "build",
+        "presentation": {
+          "echo": true,
+          "reveal": "always",
+          "focus": false,
+          "panel": "shared"
+        },
+        "problemMatcher": []
+      },
+      {
+        "label": "Check Trading Engine Health",
+        "type": "shell",
+        "command": "./scripts/monitoring/comprehensive_health_check.sh",
+        "group": "test",
+        "presentation": {
+          "echo": true,
+          "reveal": "always",
+          "focus": false,
+          "panel": "shared"
+        },
+        "problemMatcher": []
+      },
+      {
+        "label": "Start Local Trading (Mock Mode)",
+        "type": "shell",
+        "command": "python",
+        "args": ["enhanced_signal_generator.py", "--mode", "mock"],
+        "group": "build",
+        "presentation": {
+          "echo": true,
+          "reveal": "always",
+          "focus": false,
+          "panel": "shared"
+        },
+        "problemMatcher": []
+      },
+      {
+        "label": "Run Trading Tests",
+        "type": "shell",
+        "command": "pytest",
+        "args": ["tests/", "-v"],
+        "group": "test",
+        "presentation": {
+          "echo": true,
+          "reveal": "always",
+          "focus": false,
+          "panel": "shared"
+        },
+        "problemMatcher": []
+      },
+      {
+        "label": "View Portfolio Status",
+        "type": "shell",
+        "command": "curl",
+        "args": ["http://localhost:8024/portfolio"],
+        "group": "test",
+        "presentation": {
+          "echo": true,
+          "reveal": "always",
+          "focus": false,
+          "panel": "shared"
+        },
+        "problemMatcher": []
+      },
+      {
+        "label": "Emergency Stop Trading",
+        "type": "shell",
+        "command": "kubectl",
+        "args": ["scale", "deployment/trade-execution", "--replicas=0", "-n", "crypto-trading"],
+        "group": "build",
+        "presentation": {
+          "echo": true,
+          "reveal": "always",
+          "focus": true,
+          "panel": "shared"
+        },
+        "problemMatcher": []
+      }
+    ]
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Signal Generator (Mock Mode)",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${workspaceFolder}/enhanced_signal_generator.py",
+        "args": ["--mode", "mock", "--debug"],
+        "console": "integratedTerminal",
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}",
+          "TRADING_MODE": "mock",
+          "DEBUG": "true"
+        }
+      },
+      {
+        "name": "Automated Live Trader (Mock Mode)",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${workspaceFolder}/automated_live_trader.py",
+        "args": ["--mode", "mock"],
+        "console": "integratedTerminal",
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}",
+          "TRADING_MODE": "mock"
+        }
+      },
+      {
+        "name": "Signal Bridge Service",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${workspaceFolder}/services/signals/automated_signal_bridge_service.py",
+        "console": "integratedTerminal",
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}"
+        }
+      },
+      {
+        "name": "Portfolio Rebalancer",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${workspaceFolder}/services/portfolio/portfolio_rebalancer.py",
+        "console": "integratedTerminal",
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}"
+        }
+      },
+      {
+        "name": "Debug Current File",
+        "type": "debugpy",
+        "request": "launch",
+        "program": "${file}",
+        "console": "integratedTerminal",
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}"
+        }
+      }
+    ]
+  }
+}

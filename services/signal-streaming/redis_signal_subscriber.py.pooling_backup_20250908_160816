@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""
+Redis Signal Subscriber for Real-Time Signal Processing
+Subscribes to Redis pub-sub for instant signal delivery to trading system
+"""
+
+import os
+import redis
+import json
+import logging
+import threading
+import time
+import mysql.connector
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Callable
+import queue
+import requests
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [REDIS_SUBSCRIBER] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class RedisSignalSubscriber:
+    """Real-time signal subscriber using Redis pub-sub"""
+    
+    def __init__(self, signal_callback: Optional[Callable] = None):
+        # Redis configuration
+        self.redis_host = os.environ.get('REDIS_HOST', 'redis')
+        self.redis_port = int(os.environ.get('REDIS_PORT', 6379))
+        self.redis_db = int(os.environ.get('REDIS_DB', 0))
+        
+        # Signal processing callback
+        self.signal_callback = signal_callback
+        
+        # Redis connections (separate for pub/sub)
+        self.redis_client = None
+        self.pubsub = None
+        
+        # Signal queue for processing
+        self.signal_queue = queue.Queue(maxsize=1000)
+        
+        # Metrics
+        self.signals_received = 0
+        self.signals_processed = 0
+        self.processing_errors = 0
+        self.start_time = datetime.utcnow()
+        
+        # Processing thread
+        self.processing_thread = None
+        self.running = False
+        
+    def connect_redis(self) -> bool:
+        """Connect to Redis server"""
+        try:
+            self.redis_client = redis.Redis(
+                host=self.redis_host,
+                port=self.redis_port,
+                db=self.redis_db,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_timeout=5
+            )
+            
+            # Test connection
+            self.redis_client.ping()
+            
+            # Create pub/sub connection
+            self.pubsub = self.redis_client.pubsub()
+            
+            logger.info(f"✅ Connected to Redis: {self.redis_host}:{self.redis_port}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Redis connection failed: {e}")
+            return False
+    
+    def subscribe_to_channels(self) -> bool:
+        """Subscribe to signal channels"""
+        try:
+            if not self.pubsub:
+                if not self.connect_redis():
+                    return False
+            
+            # Subscribe to multiple channels
+            channels = [
+                'trading_signals',  # Main channel
+                'trading_signals_buy',  # Buy signals
+                'trading_signals_sell',  # Sell signals
+                'trading_signals_strong_buy',  # Strong buy signals
+                'trading_signals_strong_sell'  # Strong sell signals
+            ]
+            
+            for channel in channels:
+                self.pubsub.subscribe(channel)
+            
+            logger.info(f"📡 Subscribed to {len(channels)} signal channels")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to subscribe to channels: {e}")
+            return False
+    
+    def process_signal_message(self, message: Dict) -> bool:
+        """Process a signal message from Redis"""
+        try:
+            if message['type'] != 'message':
+                return True  # Skip non-message events
+            
+            # Parse signal data
+            signal_data = json.loads(message['data'])
+            
+            # Add processing metadata
+            signal_data['redis_received_at'] = datetime.utcnow().isoformat()
+            signal_data['processing_latency'] = (
+                datetime.utcnow() - datetime.fromisoformat(signal_data['timestamp'])
+            ).total_seconds()
+            
+            # Add to processing queue
+            try:
+                self.signal_queue.put_nowait(signal_data)
+                self.signals_received += 1
+                
+                logger.debug(f"📥 Queued signal: {signal_data['symbol']} {signal_data['signal_type']} "
+                           f"(latency: {signal_data['processing_latency']:.3f}s)")
+                
+            except queue.Full:
+                logger.warning("⚠️ Signal queue full, dropping signal")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing signal message: {e}")
+            return False
+    
+    def signal_processor_worker(self):
+        """Worker thread for processing signals"""
+        logger.info("🔄 Signal processor worker started")
+        
+        while self.running:
+            try:
+                # Get signal from queue (1 second timeout)
+                signal = self.signal_queue.get(timeout=1)
+                
+                # Process signal
+                if self.signal_callback:
+                    try:
+                        # Call the callback function
+                        success = self.signal_callback(signal)
+                        
+                        if success:
+                            self.signals_processed += 1
+                            logger.debug(f"✅ Processed signal: {signal['symbol']} {signal['signal_type']}")
+                        else:
+                            self.processing_errors += 1
+                            logger.warning(f"⚠️ Signal processing failed: {signal['symbol']} {signal['signal_type']}")
+                            
+                    except Exception as e:
+                        logger.error(f"❌ Signal callback error: {e}")
+                        self.processing_errors += 1
+                else:
+                    # Default processing (just log)
+                    logger.info(f"📊 Signal: {signal['symbol']} {signal['signal_type']} "
+                               f"(confidence: {signal['confidence']:.3f})")
+                    self.signals_processed += 1
+                
+                # Mark task as done
+                self.signal_queue.task_done()
+                
+            except queue.Empty:
+                continue  # No signals to process
+            except Exception as e:
+                logger.error(f"❌ Error in signal processor: {e}")
+                time.sleep(1)
+        
+        logger.info("🛑 Signal processor worker stopped")
+    
+    def start_listening(self) -> bool:
+        """Start listening for signals"""
+        try:
+            if not self.subscribe_to_channels():
+                return False
+            
+            self.running = True
+            
+            # Start signal processor thread
+            self.processing_thread = threading.Thread(
+                target=self.signal_processor_worker,
+                daemon=True
+            )
+            self.processing_thread.start()
+            
+            logger.info("🎧 Started listening for Redis signals...")
+            
+            # Listen for messages
+            for message in self.pubsub.listen():
+                if not self.running:
+                    break
+                
+                self.process_signal_message(message)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error starting signal listener: {e}")
+            return False
+    
+    def stop_listening(self):
+        """Stop listening for signals"""
+        logger.info("🛑 Stopping Redis signal listener...")
+        
+        self.running = False
+        
+        if self.pubsub:
+            self.pubsub.close()
+        
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.processing_thread.join(timeout=5)
+        
+        logger.info("✅ Redis signal listener stopped")
+    
+    def get_metrics(self) -> Dict:
+        """Get subscriber metrics"""
+        uptime = (datetime.utcnow() - self.start_time).total_seconds()
+        
+        return {
+            'signals_received': self.signals_received,
+            'signals_processed': self.signals_processed,
+            'processing_errors': self.processing_errors,
+            'queue_size': self.signal_queue.qsize(),
+            'processing_rate': self.signals_processed / uptime if uptime > 0 else 0,
+            'error_rate': self.processing_errors / max(self.signals_received, 1),
+            'uptime_seconds': uptime,
+            'running': self.running,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+
+class RealTimeSignalBridge:
+    """Enhanced signal bridge with Redis real-time streaming"""
+    
+    def __init__(self):
+        # Database configuration
+        self.signals_db_config = {
+            'host': os.environ.get('DATABASE_HOST', 'host.docker.internal'),
+            'user': os.environ.get('DATABASE_USER', 'news_collector'),
+            'password': os.environ.get('DATABASE_PASSWORD', '99Rules!'),
+            'database': os.environ.get('SIGNALS_DATABASE', 'crypto_prices'),
+            'port': int(os.environ.get('DATABASE_PORT', 3306))
+        }
+        
+        self.trades_db_config = {
+            'host': os.environ.get('DATABASE_HOST', 'host.docker.internal'),
+            'user': os.environ.get('DATABASE_USER', 'news_collector'),
+            'password': os.environ.get('DATABASE_PASSWORD', '99Rules!'),
+            'database': os.environ.get('TRADES_DATABASE', 'crypto_transactions'),
+            'port': int(os.environ.get('DATABASE_PORT', 3306))
+        }
+        
+        # Trading configuration
+        self.trade_execution_url = os.environ.get('TRADE_EXECUTION_URL', 'http://host.docker.internal:8024')
+        
+        # Redis subscriber
+        self.redis_subscriber = RedisSignalSubscriber(signal_callback=self.process_real_time_signal)
+        
+        # Fallback polling
+        self.fallback_enabled = True
+        self.last_fallback_check = datetime.utcnow()
+        
+    def process_real_time_signal(self, signal: Dict) -> bool:
+        """Process a real-time signal from Redis"""
+        try:
+            logger.info(f"⚡ Real-time signal: {signal['symbol']} {signal['signal_type']} "
+                       f"(confidence: {signal['confidence']:.3f}, "
+                       f"latency: {signal.get('processing_latency', 0):.3f}s)")
+            
+            # Convert to trade recommendation
+            recommendation = self.convert_signal_to_recommendation(signal)
+            
+            if recommendation:
+                # Save recommendation to database
+                rec_id = self.save_recommendation(recommendation)
+                
+                if rec_id:
+                    logger.info(f"✅ Created recommendation {rec_id} from real-time signal")
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing real-time signal: {e}")
+            return False
+    
+    def convert_signal_to_recommendation(self, signal: Dict) -> Optional[Dict]:
+        """Convert signal to trade recommendation"""
+        try:
+            # Determine action
+            signal_type = signal['signal_type'].upper()
+            if signal_type in ['BUY', 'STRONG_BUY']:
+                action = 'BUY'
+                priority = 'high' if signal_type == 'STRONG_BUY' else 'medium'
+            elif signal_type in ['SELL', 'STRONG_SELL']:
+                action = 'SELL'
+                priority = 'high' if signal_type == 'STRONG_SELL' else 'medium'
+            else:
+                return None
+            
+            # Calculate amount based on confidence and risk management
+            confidence = float(signal['confidence'])  # Convert Decimal to float
+            max_position_size = float(os.environ.get('MAX_POSITION_SIZE_USD', 500))
+            
+            # Scale amount by confidence (minimum 20% for high confidence signals)
+            amount_usd = max_position_size * max(0.2, confidence)
+            
+            recommendation = {
+                'symbol': signal['symbol'],
+                'action': action,
+                'amount_usd': amount_usd,
+                'current_price': float(signal['price']),  # Convert Decimal to float
+                'confidence': confidence,
+                'reasoning': f"Real-time ML signal: {signal_type} (confidence: {confidence:.3f})",
+                'priority': priority,
+                'signal_id': signal['signal_id'],
+                'model_version': signal.get('model_version', 'unknown'),
+                'created_at': datetime.utcnow(),
+                'source': 'redis_real_time',
+                'signal_strength': float(signal.get('signal_strength', 0)),  # Convert Decimal to float
+                'processing_latency': signal.get('processing_latency', 0)
+            }
+            
+            return recommendation
+            
+        except Exception as e:
+            logger.error(f"❌ Error converting signal to recommendation: {e}")
+            return None
+    
+    def save_recommendation(self, recommendation: Dict) -> Optional[int]:
+        """Save recommendation to database"""
+        try:
+            conn = mysql.connector.connect(**self.trades_db_config)
+            cursor = conn.cursor()
+            
+            query = """
+            INSERT INTO trade_recommendations 
+            (symbol, action, amount_usd, current_price, confidence, reasoning, 
+             priority, signal_id, model_version, source, processing_latency_ms, generated_at, is_mock)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), 0)
+            """
+            
+            cursor.execute(query, (
+                recommendation['symbol'],
+                recommendation['action'],
+                recommendation['amount_usd'],
+                recommendation['current_price'],
+                recommendation['confidence'],
+                recommendation['reasoning'],
+                recommendation['priority'],
+                recommendation.get('signal_id'),
+                recommendation.get('model_version'),
+                recommendation.get('source'),
+                int(recommendation.get('processing_latency', 0) * 1000)  # Convert to ms
+            ))
+            
+            recommendation_id = cursor.lastrowid
+            conn.commit()
+            
+            cursor.close()
+            conn.close()
+            
+            return recommendation_id
+            
+        except Exception as e:
+            logger.error(f"❌ Error saving recommendation: {e}")
+            return None
+    
+    def start_real_time_bridge(self):
+        """Start the real-time signal bridge"""
+        logger.info("🚀 Starting Real-Time Signal Bridge...")
+        
+        try:
+            # Start Redis subscriber
+            self.redis_subscriber.start_listening()
+            
+        except KeyboardInterrupt:
+            logger.info("🛑 Shutdown signal received")
+            self.redis_subscriber.stop_listening()
+        except Exception as e:
+            logger.error(f"❌ Real-time bridge error: {e}")
+
+def main():
+    """Main function for testing"""
+    bridge = RealTimeSignalBridge()
+    bridge.start_real_time_bridge()
+
+if __name__ == "__main__":
+    main()
