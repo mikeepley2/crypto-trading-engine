@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Machine Learning Models (Large Binary Files)
+*.joblib
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.model
+*.weights
+*.bin
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.pb
+model_base64.txt
+
+# API Keys and Secrets
+*.json
+!requirements*.json
+!package*.json
+!tsconfig*.json
+.env
+.env.*
+config.env
+*api_key*
+*private_key*
+*secret*
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Docker
+.dockerignore
+Dockerfile*
+docker-compose*.yml
+
+# Kubernetes temporary files
+kind
+*.yaml.bak
+*.yaml.old
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# Large data files
+*.csv
+*.parquet
+*.feather
+*.arrow
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+*.temp
