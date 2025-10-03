@@ -37,6 +37,11 @@ MANIFEST
 *.pb
 model_base64.txt
 
+# Remove existing large model files from tracking
+services/ml/ml_models_optimized/**/*.joblib
+services/signal-generation/ml-engine/*.joblib
+services/signals/*.joblib
+
 # API Keys and Secrets
 *.json
 !requirements*.json
