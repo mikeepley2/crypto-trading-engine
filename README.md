@@ -1,4 +1,111 @@
-# Crypto Trading Engine ⚡ **LIVE TRADING SYSTEM**
+# Crypto Trading Engine ⚡ **LIVE PRODUCTION SYSTEM**
+
+## 🌐 **Multi-Project Ecosystem Architecture**
+
+### **🔗 Distributed Node Architecture**
+
+This crypto trading engine is one of **4 specialized nodes** in a distributed AI trading ecosystem:
+
+### **🔄 Cross-Node Data Flow**
+```mermaid
+graph TD
+    A[crypto-data-collection] -->|Market Data| B[aitest Hub]
+    B -->|ML Signals| C[crypto-trading-engine]
+    C -->|Trade Results| B
+    D[crypto-monitoring] -->|Health Checks| A
+    D -->|Health Checks| B  
+    D -->|Health Checks| C
+    B -->|Alerts| D
+```
+
+**Data Flow Process:**
+1. **crypto-data-collection** → Ingests real-time market data, news, sentiment
+2. **aitest** → Processes data through ML models, generates trading signals
+3. **crypto-trading-engine** → Executes trades based on signals and portfolio rules
+4. **crypto-monitoring** → Tracks all system metrics and performance across nodes
+
+### **🏗️ Development Environment Setup**
+
+#### **Prerequisites for Multi-Node Development**
+```bash
+# Clone all ecosystem projects
+git clone https://github.com/mikeepley2/aitest.git e:/git/aitest
+git clone https://github.com/mikeepley2/crypto-data-collection.git e:/git/crypto-data-collection
+git clone https://github.com/mikeepley2/crypto-monitoring.git e:/git/crypto-monitoring  
+git clone https://github.com/mikeepley2/crypto-trading-engine.git e:/git/crypto-trading-engine
+
+# Use shared production environment
+export ENV_FILE="e:/git/aitest/.env.live"
+
+# Deploy to shared Kubernetes namespace
+kubectl create namespace crypto-ecosystem
+```
+
+#### **Project Dependencies**
+- **Primary Environment**: Always source `e:\git\aitest\.env.live` for production credentials
+- **Shared Database**: MySQL at `192.168.230.163` (production) or `host.docker.internal` (development)
+- **Message Bus**: Redis for cross-node communication and real-time data streams
+- **ML Models**: Centralized in `e:\git\aitest\ml_models_production\` directory
+
+## 🏗️ **Multi-Platform Trading Architecture**ecture**
+This trading engine operates as part of a **4-node distributed AI crypto ecosystem**, each project serving specialized functions:
+
+#### **Node 1: aitest** (`e:\git\aitest`) 🧠 **ORCHESTRATION HUB**
+- **Role**: Primary orchestration, shared resources, and ML model management
+- **Services**: LLM integration (Ollama), sentiment analysis, strategy coordination
+- **Resources**: Production environment variables (`.env.live`), ML model storage
+- **Database**: Central MySQL instance with shared schemas and connection pooling
+
+#### **Node 2: crypto-data-collection** 📊 **DATA INGESTION**
+- **Role**: Market data collection, processing, and normalization
+- **Sources**: Real-time price feeds, news sentiment, social media signals
+- **Processing**: OHLCV aggregation, technical indicators, market microstructure
+- **Output**: Clean, normalized data streams for ML training and trading decisions
+
+#### **Node 3: crypto-monitoring** 📈 **SYSTEM MONITORING**
+- **Role**: Infrastructure monitoring, alerting, and performance analytics
+- **Tools**: Grafana dashboards, Prometheus metrics, log aggregation
+- **Monitoring**: Service health, trade performance, ML model accuracy, system resources
+- **Alerting**: Real-time notifications for system failures and trading anomalies
+
+#### **Node 4: crypto-trading-engine** (this project) ⚡ **TRADE EXECUTION**
+- **Role**: Live trade execution, ML signal generation, and portfolio management
+- **Components**: XGBoost models, Coinbase integration, risk management
+- **Execution**: Real-time trade placement, position sizing, portfolio rebalancing
+- **Performance**: 66.5% ML accuracy, live trading with real money
+
+### **🚀 Kubernetes Deployment Architecture**
+```yaml
+# K8s Namespace: crypto-ecosystem
+
+# aitest services
+- ollama-llm-service
+- sentiment-analyzer
+- strategy-coordinator
+
+# crypto-data-collection services  
+- price-collector
+- news-scraper
+- social-sentiment
+
+# crypto-monitoring services
+- grafana-dashboard
+- prometheus-metrics
+- alert-manager
+
+# crypto-trading-engine services (this project)
+- signal-generator
+- trade-executor
+- portfolio-manager
+- risk-manager
+```
+
+### **🔧 Shared Infrastructure Components**
+- **Database**: Centralized MySQL (`192.168.230.163`) with cross-node schemas
+- **Message Bus**: Redis pub/sub for real-time data streaming between nodes
+- **ML Models**: Centralized XGBoost model storage in aitest project
+- **Configuration**: Production credentials shared from `aitest/.env.live`
+- **Monitoring**: Unified dashboards showing metrics from all 4 nodesNG SYSTEM**
 
 A **production-ready** AI-powered automated cryptocurrency trading engine leveraging advanced machine learning, large language models, and comprehensive sentiment analysis. Currently **LIVE TRADING** with real money, achieving 66.5% ML prediction accuracy through proven XGBoost models and comprehensive Kubernetes infrastructure.
 
@@ -40,7 +147,28 @@ A **production-ready** AI-powered automated cryptocurrency trading engine levera
 - **Support/Resistance**: ML-based level identification with strength scoring
 - **Volume Analysis**: Market microstructure interpretation for entry/exit timing
 
-## 🏗️ **Multi-Platform Trading Architecture**
+## � **Ecosystem Integration**
+
+### **🔗 Multi-Node Architecture**
+This trading engine is a **specialized node** within the larger AI trading ecosystem:
+- **Main Project**: `e:\git\aitest\backend\services\trading` (primary ecosystem)
+- **Shared Resources**: Database connections, Redis cache, ML models, and configuration
+- **Environment Configuration**: Uses `e:\git\aitest\.env.live` for production credentials
+- **Cross-Node Communication**: REST APIs and shared database for service coordination
+
+### **🗄️ Shared Database Architecture**
+- **Primary MySQL**: `host.docker.internal:3306` (Windows) / `192.168.230.163:3306` (Kubernetes)
+- **Trading Database**: `crypto_transactions` (shared with other trading nodes)
+- **ML Database**: `crypto_prices` (historical data and signals across ecosystem)
+- **Credentials**: Unified across ecosystem (`news_collector` / `99Rules!`)
+
+### **⚡ Inter-Node Dependencies**
+- **Signal Generation**: Shares ML models and predictions across nodes
+- **Portfolio Coordination**: Synchronized position tracking and risk management
+- **Trade Execution**: Coordinated to avoid conflicts between different trading strategies
+- **Configuration Management**: Centralized settings and API credentials
+
+## �🏗️ **Multi-Platform Trading Architecture**
 
 ### **🎯 Platform Support**
 - **✅ Coinbase Advanced Trade API**: JWT authentication with EC/HMAC signing
@@ -308,6 +436,37 @@ kubectl logs -n crypto-trading deployment/trade-execution -f
 # Debug specific issues
 kubectl describe pod -n crypto-trading <pod-name>
 ```
+
+## 📚 **Developer Quick Reference**
+
+### **Multi-Project Commands**
+```bash
+# Check health across all nodes
+curl http://localhost:8025/health  # crypto-trading-engine
+curl http://localhost:3001/health  # crypto-data-collection  
+curl http://localhost:3000/health  # crypto-monitoring
+curl http://localhost:8080/health  # aitest services
+
+# View cross-node logs
+kubectl logs -n crypto-ecosystem -l app=signal-generator
+kubectl logs -n crypto-ecosystem -l app=data-collector
+kubectl logs -n crypto-ecosystem -l app=trade-executor
+
+# Restart entire ecosystem
+kubectl rollout restart deployment -n crypto-ecosystem
+```
+
+### **Environment Variables Priority**
+1. **aitest/.env.live** → Primary source for all production credentials
+2. **crypto-trading-engine/.env.live** → Local overrides (links to aitest)
+3. **Kubernetes Secrets** → Container-level environment variables
+4. **Docker Compose** → Development environment variables
+
+### **Database Schemas by Node**
+- **aitest**: `crypto_strategies`, `llm_analysis`, `portfolio_optimization`
+- **crypto-data-collection**: `crypto_prices`, `market_data`, `news_sentiment`
+- **crypto-trading-engine**: `crypto_transactions`, `trade_recommendations`, `live_trades`
+- **crypto-monitoring**: `system_metrics`, `performance_logs`, `alerts`
 
 ## 🤝 **Contributing**
 

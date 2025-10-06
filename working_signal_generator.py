@@ -62,8 +62,12 @@ def load_model():
     """Load the XGBoost model"""
     global model
     
-    # Try multiple model paths
+    # Try multiple model paths - prioritize the balanced realistic model
     model_paths = [
+        "balanced_realistic_model_20251005_155755.joblib", # New balanced model with 73.3% accuracy and 27.5% positive class
+        "comprehensive_full_dataset_model_20251005_113714.joblib", # Previous comprehensive model (too conservative)
+        "fast_hypertuned_model_full_dataset.joblib", # Previous hypertuned model
+        "retrained_model_with_available_features.joblib", # Previous retrained model
         "/app/full_dataset_gpu_xgboost_model_20250827_130225.joblib",
         "optimal_66_percent_xgboost_actual.joblib",
         "real_model.joblib",
@@ -80,7 +84,7 @@ def load_model():
                 if hasattr(model, 'predict') and hasattr(model, 'predict_proba'):
                     # Test model with dummy data
                     try:
-                        dummy_features = np.random.random((1, 79))  # 79 features
+                        dummy_features = np.random.random((1, 51))  # 51 features for comprehensive model
                         test_prediction = model.predict_proba(dummy_features)
                         if test_prediction is not None and len(test_prediction) > 0:
                             health_status["model_loaded"] = True
@@ -142,14 +146,15 @@ def get_latest_features(symbol):
         result = cursor.fetchone()
         
         if result:
-            # Convert to the format expected by the model - EXCLUDE metadata columns
+            # Exclude metadata columns
             excluded_columns = {
                 'id', 'symbol', 'timestamp', 'price', 'price_date', 'price_hour', 
                 'timestamp_iso', 'created_at', 'updated_at'
             }
             feature_columns = [col for col in result.keys() if col not in excluded_columns]
             
-            # Extract all features, using 0.0 for NULL values
+            # Extract features in the same order as the comprehensive model
+            # The comprehensive model uses 51 specific features after optimization
             features = []
             for col in feature_columns:
                 value = result[col]
@@ -161,14 +166,16 @@ def get_latest_features(symbol):
                 else:
                     features.append(0.0)
             
-            logger.info(f"🔍 {symbol} features: {len(features)}/{len(feature_columns)} processed")
+            # Ensure we have exactly 51 features (pad or truncate if needed)
+            if len(features) > 51:
+                features = features[:51]  # Take first 51 features
+            elif len(features) < 51:
+                features.extend([0.0] * (51 - len(features)))  # Pad with zeros
             
-            # Should have exactly 79 features
-            if len(features) == 79:
-                return np.array(features).reshape(1, -1)
-            else:
-                logger.error(f"❌ {symbol} feature count mismatch: got {len(features)}, expected 79")
-                return None
+            logger.info(f"🔍 {symbol} features: {len(features)} processed for comprehensive model")
+            
+            # Return features array (should match the comprehensive model's expected input)
+            return np.array(features).reshape(1, -1)
         
         return None
         
@@ -202,8 +209,8 @@ def generate_signal(symbol, features):
             return {
                 'symbol': symbol,
                 'signal_type': signal_type,
-                'confidence': confidence,
-                'prediction': prediction,
+                'confidence': float(confidence),  # Convert to Python float
+                'prediction': int(prediction),    # Convert to Python int
                 'model_version': 'fallback_mode'
             }
         
@@ -217,19 +224,19 @@ def generate_signal(symbol, features):
             probabilities = model.predict_proba(features)[0]
             confidence = max(probabilities)
             
-            # Convert prediction to signal
-            if prediction == 1 and confidence > 0.5:  # Buy signal
+            # Convert prediction to signal with optimized thresholds for balanced model
+            if prediction == 1 and confidence > 0.5:  # Buy signal with moderate confidence (27.5% positive class)
                 signal_type = "BUY"
-            elif prediction == 0 and confidence > 0.5:  # Sell signal
-                signal_type = "SELL"
-            else:
+            elif prediction == 0 and confidence > 0.6:  # Strong HOLD signal
                 signal_type = "HOLD"
+            else:
+                signal_type = "HOLD"  # Default to HOLD for low confidence
             
             return {
                 'symbol': symbol,
                 'signal_type': signal_type,
-                'confidence': confidence,
-                'prediction': prediction,
+                'confidence': float(confidence),  # Convert numpy float32 to Python float
+                'prediction': int(prediction),    # Convert numpy int to Python int
                 'model_version': 'xgboost_ml_model'
             }
         except Exception as ml_error:

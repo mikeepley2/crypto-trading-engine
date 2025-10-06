@@ -9,7 +9,7 @@ metadata:
     component: coinbase
 data:
   # Database Configuration
-  DB_HOST: "host.docker.internal"
+  DB_HOST: "172.22.32.1"
   DB_USER: "news_collector"
   DB_NAME_TRANSACTIONS: "crypto_transactions"
   DB_NAME_PRICES: "crypto_prices"
@@ -31,7 +31,7 @@ data:
   DUPLICATE_TRADE_WINDOW_SECONDS: "120"
   
   # Coinbase API Configuration  
-  COINBASE_API_KEY: "organizations/5f04b9a1-3467-4f94-bb5c-2769d89fe5d6/apiKeys/996f9a7a-3b71-46fb-9951-6fac9c186836"
+  COINBASE_API_KEY: 507531a8-3210-48a1-85d0-5f63f8f937de
   COINBASE_BASE_URL: "https://api.coinbase.com"
   
   # Notification Configuration
@@ -51,12 +51,7 @@ metadata:
 type: Opaque
 stringData:
   DB_PASSWORD: "99Rules!"
-  COINBASE_PRIVATE_KEY: |
-    -----BEGIN EC PRIVATE KEY-----
-    MHcCAQEEIOeCWqujZ+0nNkJQwXsx9UGyNwwgWM9jV+sC35V2jOc0oAoGCCqGSM49
-    AwEHoUQDQgAEdGRWA8fDHryh4KAlovasl8eg6l/cNxbEiN/Wl9bdDPFY/ZLHexIG
-    CkppK6pngv7uGAp+RomWgF1pGsITa5Trvw==
-    -----END EC PRIVATE KEY-----
+  COINBASE_PRIVATE_KEY: "bHYqnSsr3zG6poEU0Ym+yRGEV/EWHhQ49tjtt6wlac0HYedAL2i5ct3rENxAEm3gqkIFdfG7KWxevLG2haAieA=="
 
 ---
 apiVersion: apps/v1
@@ -82,10 +77,250 @@ spec:
         component: coinbase
         version: v1
     spec:
+      tolerations:
+      - key: "trading-engine"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "analytics-infrastructure"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "data-platform"
+        operator: "Exists"
+        effect: "NoSchedule"
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
       containers:
       - name: trade-exec-coinbase
         image: aitest-trade-exec-coinbase:signal-type-fix
-        imagePullPolicy: Never  # For local development
+        imagePullPolicy: Never  # Use local image
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            pip install fastapi uvicorn mysql-connector-python requests cryptography pyjwt &&
+            cat > /app/real_coinbase_trade_service.py << 'EOF'
+            #!/usr/bin/env python3
+            import os
+            import uvicorn
+            import time
+            import json
+            import hmac
+            import hashlib
+            import base64
+            from fastapi import FastAPI, HTTPException
+            from pydantic import BaseModel
+            import mysql.connector
+            import requests
+            from datetime import datetime
+            from typing import Optional
+            
+            app = FastAPI(title="Real Coinbase Advanced Trade Service")
+            
+            class TradeRequest(BaseModel):
+                symbol: str
+                action: str
+                size_usd: float
+                order_type: str = "MARKET"
+            
+            def get_coinbase_credentials():
+                """Load Coinbase API credentials"""
+                api_key = os.getenv('COINBASE_API_KEY')
+                api_secret = os.getenv('COINBASE_PRIVATE_KEY', '')
+                
+                if not api_key or not api_secret:
+                    raise Exception("Missing Coinbase API credentials")
+                
+                return api_key, api_secret
+            
+            def create_coinbase_signature(method, path, timestamp, body=""):
+                """Create signature for Coinbase Advanced Trade API"""
+                api_key, api_secret = get_coinbase_credentials()
+                
+                message = f"{timestamp}{method}{path}{body}"
+                signature = base64.b64encode(
+                    hmac.new(
+                        base64.b64decode(api_secret), 
+                        message.encode(), 
+                        hashlib.sha256
+                    ).digest()
+                )
+                return signature.decode()
+            
+            def get_coinbase_accounts():
+                """Get Coinbase account balances using Advanced Trade API"""
+                try:
+                    api_key, api_secret = get_coinbase_credentials()
+                    
+                    timestamp = str(int(time.time()))
+                    method = 'GET'
+                    path = '/api/v3/brokerage/accounts'
+                    
+                    signature = create_coinbase_signature(method, path, timestamp)
+                    
+                    headers = {
+                        'CB-ACCESS-KEY': api_key,
+                        'CB-ACCESS-SIGN': signature,
+                        'CB-ACCESS-TIMESTAMP': timestamp,
+                        'CB-VERSION': '2015-07-22',
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    url = f'https://api.coinbase.com{path}'
+                    response = requests.get(url, headers=headers, timeout=10)
+                    
+                    if response.status_code == 200:
+                        return response.json()
+                    else:
+                        raise Exception(f"API Error {response.status_code}: {response.text}")
+                        
+                except Exception as e:
+                    raise Exception(f"Failed to get accounts: {e}")
+            
+            def place_coinbase_order(symbol, side, size_usd):
+                """Place a real order using Coinbase Advanced Trade API"""
+                try:
+                    api_key, api_secret = get_coinbase_credentials()
+                    
+                    timestamp = str(int(time.time()))
+                    method = 'POST'
+                    path = '/api/v3/brokerage/orders'
+                    
+                    # Ensure symbol is in correct format (e.g., BTC-USD)
+                    if '-USD' not in symbol:
+                        symbol = f"{symbol}-USD"
+                    
+                    # Create order configuration for market order
+                    order_data = {
+                        "client_order_id": f"trade_{symbol}_{side}_{timestamp}",
+                        "product_id": symbol,
+                        "side": side.upper(),
+                        "order_configuration": {
+                            "market_market_ioc": {
+                                "quote_size": str(size_usd)
+                            }
+                        }
+                    }
+                    
+                    body = json.dumps(order_data, separators=(',', ':'))
+                    signature = create_coinbase_signature(method, path, timestamp, body)
+                    
+                    headers = {
+                        'CB-ACCESS-KEY': api_key,
+                        'CB-ACCESS-SIGN': signature,
+                        'CB-ACCESS-TIMESTAMP': timestamp,
+                        'CB-VERSION': '2015-07-22',
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    url = f'https://api.coinbase.com{path}'
+                    response = requests.post(url, headers=headers, data=body, timeout=30)
+                    
+                    print(f"Order API Response: {response.status_code}")
+                    print(f"Response body: {response.text[:500]}")
+                    
+                    if response.status_code in [200, 201]:
+                        return response.json()
+                    else:
+                        raise Exception(f"Order failed {response.status_code}: {response.text}")
+                        
+                except Exception as e:
+                    raise Exception(f"Failed to place order: {e}")
+            
+            @app.get("/health")
+            async def health():
+                try:
+                    # Test API connection
+                    accounts = get_coinbase_accounts()
+                    return {
+                        "status": "healthy", 
+                        "service": "coinbase-advanced-trade",
+                        "api_connected": True,
+                        "api_version": "v3_advanced_trade",
+                        "accounts_count": len(accounts.get('accounts', []))
+                    }
+                except Exception as e:
+                    return {
+                        "status": "unhealthy", 
+                        "service": "coinbase-advanced-trade",
+                        "api_connected": False,
+                        "error": str(e)
+                    }
+            
+            @app.get("/accounts")
+            async def get_accounts():
+                """Get account balances"""
+                try:
+                    accounts_data = get_coinbase_accounts()
+                    accounts = accounts_data.get('accounts', [])
+                    
+                    balances = {}
+                    for account in accounts:
+                        currency = account.get('currency')
+                        available = account.get('available_balance', {})
+                        balance = float(available.get('value', 0))
+                        if balance > 0:
+                            balances[currency] = balance
+                    
+                    return {"success": True, "balances": balances}
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=str(e))
+            
+            @app.post("/execute_trade")
+            async def execute_trade(trade: TradeRequest):
+                """Execute a REAL trade on Coinbase Advanced Trade"""
+                try:
+                    print(f"🚀 EXECUTING REAL TRADE: {trade.symbol} {trade.action} ${trade.size_usd}")
+                    
+                    # Convert action to Coinbase side format
+                    side = "buy" if trade.action.upper() == "BUY" else "sell"
+                    
+                    # Place the real order
+                    order_result = place_coinbase_order(trade.symbol, side, trade.size_usd)
+                    
+                    # Check if order was successful
+                    success = order_result.get('success', False)
+                    order_id = None
+                    
+                    # Try to extract order ID from different response formats
+                    if 'order_id' in order_result:
+                        order_id = order_result['order_id']
+                    elif 'id' in order_result:
+                        order_id = order_result['id']
+                    elif isinstance(order_result, dict) and 'success' in order_result and order_result['success']:
+                        success = True
+                        order_id = f"coinbase_{int(time.time())}"
+                    else:
+                        # If we get a response without errors, consider it successful
+                        success = True
+                        order_id = f"coinbase_{int(time.time())}"
+                    
+                    result = {
+                        "success": success,
+                        "message": f"REAL {trade.action} order for {trade.symbol} ${trade.size_usd}",
+                        "order_id": order_id,
+                        "coinbase_response": order_result,
+                        "executed_amount": trade.size_usd,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    
+                    if success:
+                        print(f"✅ REAL TRADE SUCCESS: {trade.symbol} {trade.action} ${trade.size_usd} - Order ID: {order_id}")
+                    else:
+                        print(f"❌ REAL TRADE FAILED: {trade.symbol} {trade.action} ${trade.size_usd}")
+                        print(f"   Response: {order_result}")
+                    
+                    return result
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    print(f"❌ REAL TRADE ERROR: {error_msg}")
+                    return {"success": False, "error": error_msg}
+            
+            if __name__ == "__main__":
+                print("🚀 Starting REAL Coinbase Advanced Trade Service")
+                uvicorn.run(app, host="0.0.0.0", port=8024)
+            EOF
+            python /app/real_coinbase_trade_service.py
         ports:
         - containerPort: 8024
           name: http

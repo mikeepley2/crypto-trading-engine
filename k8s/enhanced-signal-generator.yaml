@@ -19,14 +19,14 @@ spec:
     spec:
       containers:
       - name: enhanced-signal-generator
-        image: aitest-enhanced-signal-generator:v4-full-asset-coverage
+        image: aitest-enhanced-signal-generator:with-original-model
         imagePullPolicy: Never
         ports:
         - containerPort: 8025
           name: http
         env:
         - name: DB_HOST
-          value: "192.168.230.163"
+          value: "172.22.32.1"
         - name: DB_USER
           value: "news_collector"
         - name: DB_PASSWORD
@@ -38,13 +38,15 @@ spec:
         - name: REDIS_PORT
           value: "6379"
         - name: SIGNAL_GENERATION_INTERVAL
-          value: "900"  # 15 minutes for full asset coverage
+          value: "300"  # 5 minutes - back to frequent generation
         - name: MARKET_HOURS_INTERVAL
-          value: "900"  # 15 minutes during active hours
+          value: "300"  # 5 minutes during active hours  
         - name: QUIET_HOURS_INTERVAL
-          value: "1800"  # 30 minutes during quiet hours
+          value: "600"  # 10 minutes during quiet hours
         - name: SIGNAL_BATCH_SIZE
           value: "25"  # Process 25 assets per batch
+        - name: ML_MODEL_PATH
+          value: "/app/full_dataset_gpu_xgboost_model_20250827_130225.joblib"
         resources:
           requests:
             memory: "1Gi"

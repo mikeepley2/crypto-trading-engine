@@ -45,7 +45,7 @@ COPY enhanced_signal_generator.py .
 COPY coinbase_asset_filter.py .
 
 # Copy model file if it exists (will fallback to simple mode if not found)
-RUN touch optimal_66_percent_xgboost.joblib
+COPY full_dataset_gpu_xgboost_model_20250827_130225.joblib /app/full_dataset_gpu_xgboost_model_20250827_130225.joblib
 
 # Clean up any potential corruption
 RUN sed -i 's/)TEST_MARKER_12345/)/g' signal_coherence_manager.py

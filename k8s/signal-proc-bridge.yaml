@@ -82,7 +82,7 @@ spec:
     spec:
       containers:
       - name: signal-proc-bridge
-        image: aitest-enhanced-signal-bridge:v7-asset-fix
+        image: aitest-enhanced-signal-bridge:v16-optimized-time-windows
         imagePullPolicy: Never  # For local development
         ports:
         - containerPort: 8022

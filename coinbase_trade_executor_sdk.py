@@ -23,8 +23,20 @@ class TradeRequest(BaseModel):
 
 def get_coinbase_client():
     """Initialize Coinbase REST client"""
+    # Try environment variables first
     api_key = os.getenv('COINBASE_API_KEY')
     api_secret = os.getenv('COINBASE_PRIVATE_KEY', '')
+    
+    # If not in environment, try to load from JSON file
+    if not api_key or not api_secret:
+        try:
+            with open('coinbase_api_key.json', 'r') as f:
+                creds = json.load(f)
+            api_key = creds['name']
+            api_secret = creds['privateKey']
+            print(f"Loaded API credentials from coinbase_api_key.json")
+        except Exception as e:
+            print(f"Error loading credentials from file: {e}")
     
     if not api_key or not api_secret:
         raise Exception("Missing Coinbase API credentials")

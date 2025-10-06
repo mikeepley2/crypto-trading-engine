@@ -100,15 +100,8 @@ data:
     
     class SimpleTradeOrchestrator:
         def __init__(self, max_age_minutes=None, max_trades_per_cycle=None, check_interval=None):
-            # Database configuration - auto-detect host for Docker vs direct execution
-            import socket
-            try:
-                # Try to connect to host.docker.internal first (for Docker/WSL environments)
-                socket.create_connection(('host.docker.internal', 3306), timeout=2).close()
-                db_host = 'host.docker.internal'
-            except:
-                # Fall back to localhost for direct execution
-                db_host = 'localhost'
+            # Database configuration - use Windows MySQL host
+            db_host = '172.22.32.1'
             
             self.db_config = {
                 'host': db_host,

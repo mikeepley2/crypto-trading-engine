@@ -125,8 +125,8 @@ spec:
             name: optimized-signal-config
         volumeMounts:
         - name: ml-model
-          mountPath: /app/optimal_66_percent_xgboost.joblib
-          subPath: optimal_66_percent_xgboost.joblib
+          mountPath: /app/full_dataset_gpu_xgboost_model_20250827_130225.joblib
+          subPath: full_dataset_gpu_xgboost_model_20250827_130225.joblib
         - name: anti-churn-config
           mountPath: /app/config
         resources:

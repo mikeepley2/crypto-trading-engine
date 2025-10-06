@@ -96,7 +96,7 @@ health_status = {
 def load_model():
     """Load the XGBoost model - FAIL if model cannot be loaded (NO FALLBACK MODE)"""
     global model
-    model_path = "/app/optimal_66_percent_xgboost.joblib"
+    model_path = "/app/full_dataset_gpu_xgboost_model_20250827_130225.joblib"
     
     # Check if model file exists
     if not os.path.exists(model_path):
@@ -186,12 +186,33 @@ def get_latest_features(symbol):
         result = cursor.fetchone()
         
         if result:
-            # Convert to the format expected by the model
-            feature_columns = [col for col in result.keys() if col not in ['symbol', 'timestamp', 'price']]
-            features = [result[col] for col in feature_columns if result[col] is not None]
+            # Convert to the format expected by the model - EXCLUDE metadata columns
+            excluded_columns = {
+                'id', 'symbol', 'timestamp', 'price', 'price_date', 'price_hour', 
+                'timestamp_iso', 'created_at', 'updated_at'
+            }
+            feature_columns = [col for col in result.keys() if col not in excluded_columns]
             
-            if len(features) >= 100:  # Minimum feature count
+            # Extract all 79 features, using 0.0 for NULL values
+            features = []
+            for col in feature_columns:
+                value = result[col]
+                if value is not None:
+                    try:
+                        features.append(float(value))
+                    except (ValueError, TypeError):
+                        features.append(0.0)
+                else:
+                    features.append(0.0)
+            
+            logger.info(f"🔍 {symbol} features: {len(features)}/{len(feature_columns)} processed")
+            
+            # Should have exactly 79 features
+            if len(features) == 79:
                 return np.array(features).reshape(1, -1)
+            else:
+                logger.error(f"❌ {symbol} feature count mismatch: got {len(features)}, expected 79")
+                return None
         
         return None
         
@@ -225,9 +246,9 @@ def generate_signal(symbol, features):
             confidence = max(probabilities)
             
             # Convert prediction to signal
-            if prediction == 1 and confidence > 0.7:  # Buy signal (increased threshold)
+            if prediction == 1 and confidence > 0.5:  # Buy signal (optimized threshold)
                 signal_type = "BUY"
-            elif prediction == 0 and confidence > 0.7:  # Sell signal (increased threshold)
+            elif prediction == 0 and confidence > 0.5:  # Sell signal (optimized threshold)
                 signal_type = "SELL"
             else:
                 signal_type = "HOLD"
@@ -237,7 +258,7 @@ def generate_signal(symbol, features):
                 'signal_type': signal_type,
                 'confidence': confidence,
                 'prediction': prediction,
-                'model_version': 'optimal_66_percent_xgboost'
+                'model_version': 'full_dataset_gpu_xgboost_20250827'
             }
         except Exception as ml_error:
             error_msg = f"❌ ML model prediction failed for {symbol}: {ml_error}"

@@ -97,7 +97,12 @@ health_status = {
 def load_model():
     """Load the XGBoost model - FAIL if model cannot be loaded (NO FALLBACK MODE)"""
     global model
-    model_path = "/app/optimal_66_percent_xgboost.joblib"
+    model_path = os.path.join(
+        os.path.dirname(__file__),
+        "services",
+        "signals",
+        "full_dataset_gpu_xgboost_model_20250827_130225.joblib"
+    )
     
     # Check if model file exists
     if not os.path.exists(model_path):
@@ -152,7 +157,7 @@ def get_db_connection():
     """Get database connection"""
     try:
         config = {
-            'host': os.getenv('DB_HOST', 'host.docker.internal'),
+            'host': os.getenv('DB_HOST', '172.22.32.1'),
             'user': os.getenv('DB_USER', 'news_collector'),
             'password': os.getenv('DB_PASSWORD', '99Rules!'),
             'database': os.getenv('DB_NAME', 'crypto_prices'),  # ML features from crypto_prices
@@ -171,7 +176,7 @@ def get_trading_db_connection():
     """Get trading database connection for saving signals"""
     try:
         config = {
-            'host': os.getenv('DB_HOST', 'host.docker.internal'),
+            'host': os.getenv('DB_HOST', '172.22.32.1'),
             'user': os.getenv('DB_USER', 'news_collector'),
             'password': os.getenv('DB_PASSWORD', '99Rules!'),
             'database': 'crypto_transactions',  # FIXED: Trading signals go to crypto_transactions database
@@ -210,7 +215,7 @@ def get_latest_features(symbol):
             }
             feature_columns = [col for col in result.keys() if col not in excluded_columns]
             
-            # Extract features and convert datetime.date objects to numeric
+            # Extract features and handle NULL values with defaults
             features = []
             for col in feature_columns:
                 value = result[col]
@@ -223,24 +228,26 @@ def get_latest_features(symbol):
                     elif hasattr(value, 'total_seconds'):  # timedelta object
                         features.append(float(value.total_seconds()))
                     else:
-                        # Try to convert to float, skip if not possible
+                        # Try to convert to float, use 0.0 if not possible
                         try:
                             features.append(float(value))
                         except (ValueError, TypeError):
-                            logger.debug(f"Skipping non-numeric column {col}: {type(value)}")
-                            continue
+                            logger.debug(f"Converting non-numeric column {col} to 0.0: {type(value)}")
+                            features.append(0.0)
+                else:
+                    # Use 0.0 for NULL values to maintain feature structure
+                    features.append(0.0)
             
-            logger.info(f"🔍 {symbol} feature extraction: {len(features)}/{len(feature_columns)} features available from {result.get('timestamp_iso', 'unknown timestamp')}")
+            logger.info(f"🔍 {symbol} feature extraction: {len(features)}/{len(feature_columns)} features processed from {result.get('timestamp_iso', 'unknown timestamp')}")
             
-            # Emergency fix: Pad features to match model expectations (79 features)
-            if len(features) >= 15:  # Minimum viable feature count
-                # Pad with zeros to reach expected 79 features for the ML model
-                padded_features = features + [0.0] * (79 - len(features))
-                feature_array = np.array(padded_features[:79]).reshape(1, -1)
-                logger.info(f"✅ {symbol} features ready for ML: original {len(features)}, padded to {feature_array.shape}")
+            # Ensure we have exactly 79 features (shouldn't need padding now)
+            if len(features) == 79:
+                feature_array = np.array(features).reshape(1, -1)
+                logger.info(f"✅ {symbol} features ready for ML: {len(features)} features")
                 return feature_array
             else:
-                logger.warning(f"⚠️ {symbol} insufficient features: need >=15, got {len(features)}")
+                logger.error(f"❌ {symbol} feature mismatch: got {len(features)}, expected 79")
+                return None
         
         return None
         
@@ -274,9 +281,9 @@ def generate_signal(symbol, features):
             confidence = max(probabilities)
             
             # Convert prediction to signal
-            if prediction == 1 and confidence > 0.7:  # Buy signal (increased threshold)
+            if prediction == 1 and confidence > 0.5:  # Buy signal (optimized threshold)
                 signal_type = "BUY"
-            elif prediction == 0 and confidence > 0.7:  # Sell signal (increased threshold)
+            elif prediction == 0 and confidence > 0.5:  # Sell signal (optimized threshold)
                 signal_type = "SELL"
             else:
                 signal_type = "HOLD"
@@ -286,7 +293,7 @@ def generate_signal(symbol, features):
                 'signal_type': signal_type,
                 'confidence': float(confidence),  # Convert numpy types to Python float
                 'prediction': float(prediction) if hasattr(prediction, 'item') else prediction,
-                'model_version': 'optimal_66_percent_xgboost'
+                'model_version': 'full_dataset_gpu_xgboost_20250827'
             }
         except Exception as ml_error:
             error_msg = f"❌ ML model prediction failed for {symbol}: {ml_error}"
