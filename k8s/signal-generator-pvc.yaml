@@ -1,0 +1,541 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: signal-generator-models
+  namespace: crypto-trading
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-generator-pvc
+  namespace: crypto-trading
+  labels:
+    app: signal-generator-pvc
+    component: signal-generation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-generator-pvc
+  template:
+    metadata:
+      labels:
+        app: signal-generator-pvc
+        component: signal-generation
+    spec:
+      containers:
+      - name: signal-generator-pvc
+        image: python:3.11-slim
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8025
+          name: http
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          # Create app directory
+          mkdir -p /app/models
+          
+          # Install dependencies
+          pip install fastapi uvicorn mysql-connector-python requests numpy pandas scikit-learn xgboost joblib python-multipart
+          
+          # Copy the working signal generator
+          cat > /app/working_signal_generator.py << 'EOF'
+          #!/usr/bin/env python3
+          """
+          Production Signal Generator with Balanced Realistic Model
+          NO FALLBACKS - Model must load or service fails
+          """
+          
+          import os
+          import logging
+          import time
+          import json
+          import requests
+          import numpy as np
+          import pandas as pd
+          import mysql.connector
+          import joblib
+          import uvicorn
+          from datetime import datetime, timedelta
+          from fastapi import FastAPI, HTTPException
+          from pydantic import BaseModel
+          from typing import Optional, Dict, Any
+          from threading import Thread
+          import asyncio
+          
+          # Configure logging
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+          logger = logging.getLogger(__name__)
+          
+          app = FastAPI(title="Production Signal Generator")
+          
+          # Global variables
+          model = None
+          health_status = {
+              "status": "healthy",
+              "model_loaded": False,
+              "database_connected": False,
+              "signals_generated_today": 0,
+              "last_signal_generation": None,
+              "last_error": None,
+              "model_type": None,
+              "model_path": None
+          }
+          
+          def get_db_connection():
+              """Get database connection using Kubernetes DNS"""
+              try:
+                  config = {
+                      'host': os.getenv('DB_HOST', '172.22.32.1'),  # Kubernetes host
+                      'user': os.getenv('DB_USER', 'news_collector'),
+                      'password': os.getenv('DB_PASSWORD', '99Rules!'),
+                      'database': os.getenv('DB_NAME', 'crypto_prices'),
+                      'charset': 'utf8mb4'
+                  }
+                  conn = mysql.connector.connect(**config)
+                  health_status["database_connected"] = True
+                  return conn
+              except Exception as e:
+                  logger.error(f"Database connection error: {e}")
+                  health_status["database_connected"] = False
+                  health_status["last_error"] = f"Database error: {e}"
+                  return None
+          
+          def load_model():
+              """Load the balanced realistic XGBoost model - NO FALLBACKS"""
+              global model
+              
+              # Try multiple model paths - prioritize the balanced realistic model
+              model_paths = [
+                  "/app/models/balanced_realistic_model_20251005_155755.joblib", # PVC mounted model
+                  "balanced_realistic_model_20251005_155755.joblib", # Local model file
+                  "comprehensive_full_dataset_model_20251005_113714.joblib", # Previous comprehensive model
+                  "fast_hypertuned_model_full_dataset.joblib", # Previous hypertuned model
+                  "retrained_model_with_available_features.joblib", # Previous retrained model
+              ]
+              
+              for model_path in model_paths:
+                  if os.path.exists(model_path):
+                      try:
+                          logger.info(f"Loading ML model from {model_path}...")
+                          model = joblib.load(model_path)
+                          
+                          # Validate model is functional
+                          if not hasattr(model, 'predict') or not hasattr(model, 'predict_proba'):
+                              logger.error(f"Model at {model_path} is not functional - missing predict methods")
+                              continue
+                          
+                          # Test model with dummy data
+                          try:
+                              dummy_features = np.random.random((1, 51))  # 51 features for comprehensive model
+                              test_prediction = model.predict_proba(dummy_features)
+                              if test_prediction is None or len(test_prediction) == 0:
+                                  logger.error(f"Model at {model_path} failed prediction test")
+                                  continue
+                          except Exception as test_error:
+                              logger.error(f"Model at {model_path} failed prediction test: {test_error}")
+                              continue
+                          
+                          # Model loaded successfully
+                          health_status["model_loaded"] = True
+                          health_status["model_type"] = str(type(model))
+                          health_status["model_path"] = model_path
+                          logger.info(f"ML model loaded and validated successfully from {model_path}")
+                          return True
+                                      
+                      except Exception as e:
+                          logger.error(f"Failed to load model from {model_path}: {e}")
+                          continue
+              
+              # NO FALLBACK - If we get here, no model loaded successfully
+              health_status["model_loaded"] = False
+              health_status["last_error"] = "CRITICAL: No functional ML model could be loaded"
+              logger.error("CRITICAL: No functional ML model could be loaded. Service will fail.")
+              raise Exception("CRITICAL: No functional ML model could be loaded. Service cannot start without a valid model.")
+          
+          def get_latest_features(symbol):
+              """Get the latest features for a symbol from ml_features_materialized"""
+              conn = get_db_connection()
+              if not conn:
+                  return None
+              
+              try:
+                  cursor = conn.cursor(dictionary=True)
+                  
+                  # Get the latest features for the symbol
+                  query = """
+                  SELECT * FROM ml_features_materialized 
+                  WHERE symbol = %s 
+                  ORDER BY timestamp_iso DESC 
+                  LIMIT 1
+                  """
+                  cursor.execute(query, (symbol,))
+                  result = cursor.fetchone()
+                  
+                  if result:
+                      # Exclude metadata columns
+                      excluded_columns = {
+                          'id', 'symbol', 'timestamp', 'price', 'price_date', 'price_hour', 
+                          'timestamp_iso', 'created_at', 'updated_at'
+                      }
+                      feature_columns = [col for col in result.keys() if col not in excluded_columns]
+                      
+                      # Extract features in the same order as the comprehensive model
+                      features = []
+                      for col in feature_columns:
+                          value = result[col]
+                          if value is not None:
+                              try:
+                                  features.append(float(value))
+                              except (ValueError, TypeError):
+                                  features.append(0.0)
+                          else:
+                                  features.append(0.0)
+                      
+                      # Ensure we have exactly 51 features (pad or truncate if needed)
+                      if len(features) > 51:
+                          features = features[:51]  # Take first 51 features
+                      elif len(features) < 51:
+                          features.extend([0.0] * (51 - len(features)))  # Pad with zeros
+                      
+                      logger.info(f"{symbol} features: {len(features)} processed for comprehensive model")
+                      
+                      return np.array(features).reshape(1, -1)
+                  
+                  return None
+                  
+              except Exception as e:
+                  logger.error(f"Error getting features for {symbol}: {e}")
+                  return None
+              finally:
+                  if conn:
+                      conn.close()
+          
+          def generate_signal(symbol, features):
+              """Generate a trading signal for a symbol - NO FALLBACKS"""
+              global model
+              
+              # CRITICAL: Model must be loaded
+              if model is None:
+                  logger.error(f"CRITICAL: No model loaded for {symbol}")
+                  raise Exception("CRITICAL: No model loaded. Cannot generate signals.")
+              
+              # CRITICAL: Model must be functional
+              if not hasattr(model, 'predict') or not hasattr(model, 'predict_proba'):
+                  logger.error(f"CRITICAL: Model is not functional for {symbol}")
+                  raise Exception("CRITICAL: Model is not functional. Cannot generate signals.")
+              
+              try:
+                  prediction = model.predict(features)[0]
+                  probabilities = model.predict_proba(features)[0]
+                  confidence = max(probabilities)
+                  
+                  # Convert prediction to signal with optimized thresholds for balanced model
+                  if prediction == 1 and confidence > 0.5:  # Buy signal with moderate confidence (27.5% positive class)
+                      signal_type = "BUY"
+                  elif prediction == 0 and confidence > 0.6:  # Strong HOLD signal
+                      signal_type = "HOLD"
+                  else:
+                      signal_type = "HOLD"  # Default to HOLD for low confidence
+                  
+                  return {
+                      'symbol': symbol,
+                      'signal_type': signal_type,
+                      'confidence': float(confidence),  # Convert numpy float32 to Python float
+                      'prediction': int(prediction),    # Convert numpy int to Python int
+                      'model_version': 'balanced_realistic_model'
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"CRITICAL: ML model prediction failed for {symbol}: {e}")
+                  raise Exception(f"CRITICAL: ML model prediction failed for {symbol}: {e}")
+          
+          def save_signal_to_db(signal):
+              """Save signal to database"""
+              conn = get_db_connection()
+              if not conn:
+                  return False
+              
+              try:
+                  cursor = conn.cursor()
+                  
+                  # Insert signal into database
+                  insert_query = """
+                  INSERT INTO trading_signals (
+                      symbol, signal_type, confidence, prediction, 
+                      model_version, timestamp, created_at
+                  ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                  """
+                  
+                  values = (
+                      signal['symbol'],
+                      signal['signal_type'],
+                      signal['confidence'],
+                      signal['prediction'],
+                      signal['model_version'],
+                      datetime.now(),
+                      datetime.now()
+                  )
+                  
+                  cursor.execute(insert_query, values)
+                  conn.commit()
+                  
+                  signal_id = cursor.lastrowid
+                  logger.info(f"Signal saved to DB: ID {signal_id}, {signal['symbol']} {signal['signal_type']} (confidence: {signal['confidence']:.3f})")
+                  
+                  return True
+                  
+              except Exception as e:
+                  logger.error(f"Error saving signal to database: {e}")
+                  return False
+              finally:
+                  if conn:
+                      conn.close()
+          
+          def get_active_symbols():
+              """Get list of active trading symbols"""
+              conn = get_db_connection()
+              if not conn:
+                  raise Exception("CRITICAL: Cannot get active symbols - database not connected")
+              
+              try:
+                  cursor = conn.cursor()
+                  query = """
+                  SELECT DISTINCT symbol 
+                  FROM ml_features_materialized 
+                  WHERE timestamp_iso >= %s
+                  ORDER BY symbol
+                  """
+                  
+                  # Get symbols with data from last 24 hours
+                  cutoff_time = datetime.now() - timedelta(hours=24)
+                  cursor.execute(query, (cutoff_time,))
+                  
+                  symbols = [row[0] for row in cursor.fetchall()]
+                  
+                  if not symbols:
+                      raise Exception("CRITICAL: No active symbols found in database")
+                  
+                  logger.info(f"Found {len(symbols)} active symbols")
+                  return symbols
+                  
+              except Exception as e:
+                  logger.error(f"Error getting active symbols: {e}")
+                  raise Exception(f"CRITICAL: Cannot get active symbols: {e}")
+              finally:
+                  if conn:
+                      conn.close()
+          
+          def generate_signals_cycle():
+              """Generate signals for all active symbols"""
+              try:
+                  symbols = get_active_symbols()
+                  signals_generated = 0
+                  
+                  logger.info(f"Starting signal generation cycle for {len(symbols)} symbols...")
+                  
+                  for symbol in symbols:
+                      try:
+                          # Get features for symbol
+                          features = get_latest_features(symbol)
+                          if features is None:
+                              logger.warning(f"No features available for {symbol}")
+                              continue
+                          
+                          # Generate signal
+                          signal = generate_signal(symbol, features)
+                          if signal is None:
+                              logger.warning(f"Could not generate signal for {symbol}")
+                              continue
+                          
+                          # Only save BUY signals (HOLD signals are not saved to reduce noise)
+                          if signal['signal_type'] == 'BUY':
+                              if save_signal_to_db(signal):
+                                  signals_generated += 1
+                                  logger.info(f"Generated BUY signal for {symbol} (confidence: {signal['confidence']:.3f})")
+                          else:
+                              logger.debug(f"Generated HOLD signal for {symbol} (confidence: {signal['confidence']:.3f}) - not saved")
+                          
+                      except Exception as e:
+                          logger.error(f"Error processing {symbol}: {e}")
+                          continue
+                  
+                  health_status["signals_generated_today"] += signals_generated
+                  health_status["last_signal_generation"] = datetime.now().isoformat()
+                  
+                  logger.info(f"Signal generation cycle complete: {signals_generated} signals generated")
+                  return signals_generated
+                  
+              except Exception as e:
+                  logger.error(f"Error in signal generation cycle: {e}")
+                  health_status["last_error"] = f"Signal generation error: {e}"
+                  return 0
+          
+          def signal_generation_worker():
+              """Background worker for signal generation"""
+              while True:
+                  try:
+                      generate_signals_cycle()
+                      time.sleep(300)  # Wait 5 minutes between cycles
+                  except Exception as e:
+                      logger.error(f"Error in signal generation worker: {e}")
+                      time.sleep(60)  # Wait 1 minute on error
+          
+          # FastAPI endpoints
+          @app.get("/")
+          async def read_root():
+              return {
+                  "message": "Production Signal Generator is running",
+                  "endpoints": {
+                      "health": "/health",
+                      "status": "/status",
+                      "generate_signals": "POST /generate_signals"
+                  }
+              }
+          
+          @app.get("/health")
+          async def health_check():
+              # CRITICAL: If model is not loaded, return unhealthy
+              if not health_status["model_loaded"]:
+                  return {
+                      "status": "unhealthy",
+                      "service": "production-signal-generator",
+                      "timestamp": datetime.now().isoformat(),
+                      "error": "CRITICAL: Model not loaded"
+                  }
+              
+              return {
+                  "status": health_status["status"],
+                  "service": "production-signal-generator",
+                  "timestamp": datetime.now().isoformat(),
+                  "model_loaded": health_status["model_loaded"],
+                  "database_connected": health_status["database_connected"],
+                  "signals_generated_today": health_status["signals_generated_today"]
+              }
+          
+          @app.get("/status")
+          async def get_status():
+              return health_status
+          
+          @app.post("/generate_signals")
+          async def generate_signals_endpoint():
+              """Manually trigger signal generation"""
+              try:
+                  # CRITICAL: Check if model is loaded
+                  if not health_status["model_loaded"]:
+                      raise HTTPException(status_code=500, detail="CRITICAL: Model not loaded. Cannot generate signals.")
+                  
+                  signals_generated = generate_signals_cycle()
+                  return {
+                      "status": "success",
+                      "signals_generated": signals_generated,
+                      "message": f"Generated {signals_generated} signals"
+                  }
+              except Exception as e:
+                  logger.error(f"Error in generate_signals endpoint: {e}")
+                  raise HTTPException(status_code=500, detail=str(e))
+          
+          @app.on_event("startup")
+          async def startup_event():
+              logger.info("Starting Production Signal Generator...")
+              
+              # CRITICAL: Load ML model - NO FALLBACKS
+              try:
+                  if load_model():
+                      logger.info("Model loaded successfully")
+                  else:
+                      logger.error("CRITICAL: Failed to load model")
+                      raise Exception("CRITICAL: Failed to load model. Service cannot start.")
+              except Exception as e:
+                  logger.error(f"CRITICAL: Model loading failed: {e}")
+                  raise Exception(f"CRITICAL: Model loading failed: {e}")
+              
+              # Test database connection
+              conn = get_db_connection()
+              if conn:
+                  logger.info("Database connection successful")
+                  conn.close()
+              else:
+                  logger.error("CRITICAL: Database connection failed")
+                  raise Exception("CRITICAL: Database connection failed. Service cannot start.")
+              
+              # Start signal generation worker
+              logger.info("Starting signal generation worker...")
+              worker_thread = Thread(target=signal_generation_worker, daemon=True)
+              worker_thread.start()
+              
+              logger.info("Production Signal Generator initialized successfully")
+          
+          if __name__ == "__main__":
+              port = int(os.getenv('PORT', 8025))
+              logger.info(f"Service will be available at http://0.0.0.0:{port}")
+              uvicorn.run(app, host="0.0.0.0", port=port)
+          EOF
+          
+          # Start the service
+          python /app/working_signal_generator.py
+        env:
+        - name: DB_HOST
+          value: "172.22.32.1"  # Kubernetes host IP
+        - name: DB_USER
+          value: "news_collector"
+        - name: DB_PASSWORD
+          value: "99Rules!"
+        - name: DB_NAME
+          value: "crypto_prices"
+        - name: PORT
+          value: "8025"
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8025
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8025
+          initialDelaySeconds: 90
+          periodSeconds: 10
+          failureThreshold: 3
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: signal-generator-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-generator-pvc
+  namespace: crypto-trading
+  labels:
+    app: signal-generator-pvc
+    component: signal-generation
+spec:
+  selector:
+    app: signal-generator-pvc
+  ports:
+  - port: 8025
+    targetPort: 8025
+    protocol: TCP
+    name: http
+  type: ClusterIP

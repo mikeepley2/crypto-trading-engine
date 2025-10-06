@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-generator-docker-image
+  namespace: crypto-trading
+  labels:
+    app: signal-generator-docker-image
+    component: signal-generation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-generator-docker-image
+  template:
+    metadata:
+      labels:
+        app: signal-generator-docker-image
+        component: signal-generation
+    spec:
+      containers:
+      - name: signal-generator-docker-image
+        image: signal-generator-with-model:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8025
+          name: http
+        env:
+        - name: DB_HOST
+          value: "172.22.32.1"  # Kubernetes host IP
+        - name: DB_USER
+          value: "news_collector"
+        - name: DB_PASSWORD
+          value: "99Rules!"
+        - name: DB_NAME
+          value: "crypto_prices"
+        - name: PORT
+          value: "8025"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8025
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8025
+          initialDelaySeconds: 90
+          periodSeconds: 10
+          failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-generator-docker-image
+  namespace: crypto-trading
+  labels:
+    app: signal-generator-docker-image
+    component: signal-generation
+spec:
+  selector:
+    app: signal-generator-docker-image
+  ports:
+  - port: 8025
+    targetPort: 8025
+    protocol: TCP
+    name: http
+  type: ClusterIP
