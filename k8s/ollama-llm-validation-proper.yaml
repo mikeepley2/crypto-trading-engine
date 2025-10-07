@@ -1,0 +1,200 @@
+# =============================================================================
+# OLLAMA LLM VALIDATION SERVICE - NO FALLBACK MODE
+# =============================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ollama-config
+  namespace: crypto-trading
+data:
+  OLLAMA_HOST: "0.0.0.0"
+  OLLAMA_PORT: "11434"
+  OLLAMA_DEFAULT_MODEL: "phi3:3.8b"
+  SERVICE_PORT: "8050"
+  OLLAMA_URL: "http://ollama:11434"
+
+---
+# Ollama Core Service - LLM Runtime
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: crypto-trading
+  labels:
+    app: ollama
+    component: llm-runtime
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+        component: llm-runtime
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        ports:
+        - containerPort: 11434
+          name: http
+        env:
+        - name: OLLAMA_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: ollama-config
+              key: OLLAMA_HOST
+        - name: OLLAMA_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: ollama-config
+              key: OLLAMA_PORT
+        volumeMounts:
+        - name: ollama-models
+          mountPath: /root/.ollama
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "1000m"
+          limits:
+            memory: "8Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 11434
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/tags
+            port: 11434
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /
+            port: 11434
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 10
+      volumes:
+      - name: ollama-models
+        hostPath:
+          path: /tmp/ollama-models
+          type: DirectoryOrCreate
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: crypto-trading
+  labels:
+    app: ollama
+spec:
+  selector:
+    app: ollama
+  ports:
+  - name: http
+    port: 11434
+    targetPort: 11434
+  type: ClusterIP
+
+---
+# Ollama LLM Validation Service - NO FALLBACK MODE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-llm-validation
+  namespace: crypto-trading
+  labels:
+    app: ollama-llm-validation
+    component: llm-validation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama-llm-validation
+  template:
+    metadata:
+      labels:
+        app: ollama-llm-validation
+        component: llm-validation
+    spec:
+      containers:
+      - name: ollama-llm-validation
+        image: python:3.11-slim
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8050
+          name: http
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install fastapi uvicorn mysql-connector-python requests aiohttp
+          mkdir -p /app
+          python /app/llm_validation_no_fallback.py
+        envFrom:
+        - configMapRef:
+            name: ollama-config
+        - configMapRef:
+            name: trade-exec-coinbase-config
+        env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: trade-exec-coinbase-secrets
+              key: DB_PASSWORD
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8050
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8050
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-llm-validation
+  namespace: crypto-trading
+  labels:
+    app: ollama-llm-validation
+spec:
+  selector:
+    app: ollama-llm-validation
+  ports:
+  - name: http
+    port: 8050
+    targetPort: 8050
+  type: ClusterIP

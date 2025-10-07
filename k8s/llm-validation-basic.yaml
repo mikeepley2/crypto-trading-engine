@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-validation-service
+  namespace: crypto-trading
+  labels:
+    app: llm-validation-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-validation-service
+  template:
+    metadata:
+      labels:
+        app: llm-validation-service
+    spec:
+      containers:
+      - name: llm-validation-service
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8050
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install fastapi uvicorn mysql-connector-python requests aiohttp
+          mkdir -p /app
+          echo "Waiting for Python script to be copied..."
+          while [ ! -f /app/llm_service.py ]; do sleep 5; done
+          python /app/llm_service.py
+        envFrom:
+        - configMapRef:
+            name: trade-exec-coinbase-config
+        env:
+        - name: OLLAMA_URL
+          value: "http://ollama:11434"
+        - name: OLLAMA_DEFAULT_MODEL
+          value: "phi3:3.8b"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: trade-exec-coinbase-secrets
+              key: DB_PASSWORD
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-validation-service
+  namespace: crypto-trading
+spec:
+  selector:
+    app: llm-validation-service
+  ports:
+  - name: http
+    port: 8050
+    targetPort: 8050
+  type: ClusterIP

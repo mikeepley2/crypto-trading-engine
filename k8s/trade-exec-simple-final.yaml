@@ -1,0 +1,167 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trade-exec-simple
+  namespace: crypto-trading
+  labels:
+    app: trade-exec-simple
+    category: trade-execution
+    component: coinbase
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trade-exec-simple
+  template:
+    metadata:
+      labels:
+        app: trade-exec-simple
+        category: trade-execution
+        component: coinbase
+    spec:
+      containers:
+      - name: trade-exec-simple
+        image: python:3.11-slim
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8024
+          name: http
+          protocol: TCP
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          # Install dependencies
+          pip install fastapi uvicorn requests cryptography pyjwt mysql-connector-python
+          
+          # Create the trade executor service
+          python -c "
+          import os
+          import time
+          import json
+          import jwt
+          import secrets
+          import requests
+          import mysql.connector
+          from cryptography.hazmat.primitives import serialization
+          from fastapi import FastAPI, HTTPException
+          import uvicorn
+          
+          app = FastAPI()
+          
+          def create_jwt_token(api_key, private_key, method, path):
+              private_key_obj = serialization.load_pem_private_key(private_key.encode('utf-8'), password=None)
+              timestamp = str(int(time.time()))
+              uri = f'{method.upper()} api.coinbase.com{path}'
+              payload = {'iss': 'coinbase-cloud', 'nbf': int(timestamp), 'exp': int(timestamp) + 120, 'sub': api_key, 'uri': uri}
+              headers = {'kid': api_key, 'nonce': secrets.token_hex(16)}
+              return jwt.encode(payload, private_key_obj, algorithm='ES256', headers=headers)
+          
+          def get_db_connection():
+              return mysql.connector.connect(
+                  host=os.getenv('DB_HOST', '172.22.32.1'),
+                  user=os.getenv('DB_USER', 'news_collector'),
+                  password=os.getenv('DB_PASSWORD'),
+                  database='crypto_prices'
+              )
+          
+          @app.get('/health')
+          async def health():
+              try:
+                  api_key = os.getenv('COINBASE_API_KEY')
+                  api_secret = os.getenv('COINBASE_PRIVATE_KEY')
+                  jwt_token = create_jwt_token(api_key, api_secret, 'GET', '/api/v3/brokerage/accounts')
+                  headers = {'Authorization': f'Bearer {jwt_token}', 'Content-Type': 'application/json'}
+                  response = requests.get('https://api.coinbase.com/api/v3/brokerage/accounts', headers=headers, timeout=10)
+                  return {'status': 'healthy', 'api_connected': response.status_code == 200, 'response_code': response.status_code}
+              except Exception as e:
+                  return {'status': 'unhealthy', 'error': str(e)}
+          
+          @app.get('/test')
+          async def test():
+              return {'message': 'Trade executor is running with JWT authentication'}
+          
+          @app.post('/process_recommendation/{recommendation_id}')
+          async def process_recommendation(recommendation_id: int):
+              try:
+                  # Get recommendation from database
+                  conn = get_db_connection()
+                  cursor = conn.cursor(dictionary=True)
+                  cursor.execute('SELECT * FROM trade_recommendations WHERE id = %s', (recommendation_id,))
+                  rec = cursor.fetchone()
+                  
+                  if not rec:
+                      raise HTTPException(status_code=404, detail='Recommendation not found')
+                  
+                  # Update status to EXECUTED (mock execution for now)
+                  cursor.execute('UPDATE trade_recommendations SET execution_status = %s, executed_at = NOW() WHERE id = %s', ('EXECUTED', recommendation_id))
+                  conn.commit()
+                  
+                  cursor.close()
+                  conn.close()
+                  
+                  return {
+                      'status': 'success',
+                      'message': f'Recommendation {recommendation_id} processed successfully',
+                      'recommendation': {
+                          'id': rec['id'],
+                          'symbol': rec['symbol'],
+                          'signal_type': rec['signal_type'],
+                          'amount_usd': float(rec['amount_usd']),
+                          'confidence': float(rec['confidence'])
+                      }
+                  }
+              except Exception as e:
+                  return {'status': 'error', 'message': str(e)}
+          
+          if __name__ == '__main__':
+              uvicorn.run(app, host='0.0.0.0', port=8024)
+          "
+        envFrom:
+        - configMapRef:
+            name: trade-exec-coinbase-config
+        - secretRef:
+            name: trade-exec-coinbase-secrets-fixed
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8024
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 1
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8024
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trade-exec-simple
+  namespace: crypto-trading
+  labels:
+    app: trade-exec-simple
+spec:
+  selector:
+    app: trade-exec-simple
+  ports:
+    - protocol: TCP
+      port: 8024
+      targetPort: 8024
+  type: ClusterIP

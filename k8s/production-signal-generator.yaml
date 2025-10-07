@@ -28,8 +28,8 @@ spec:
         args:
         - -c
         - |
-          # Create app directory
-          mkdir -p /app
+          # Create app directory and models subdirectory
+          mkdir -p /app/models
           
           # Install dependencies
           pip install fastapi uvicorn mysql-connector-python requests numpy pandas scikit-learn xgboost joblib python-multipart
@@ -255,29 +255,49 @@ spec:
               try:
                   cursor = conn.cursor()
                   
+                  # Get current price for the symbol (required field)
+                  try:
+                      price_query = "SELECT current_price FROM ml_features_materialized WHERE symbol = %s ORDER BY timestamp_iso DESC LIMIT 1"
+                      cursor.execute(price_query, (signal['symbol'],))
+                      price_result = cursor.fetchone()
+                      if price_result and price_result[0] is not None:
+                          # Handle Decimal type from database
+                          current_price = float(price_result[0])
+                      else:
+                          current_price = 0.0
+                  except Exception as e:
+                      logger.warning(f"Could not get price for {signal['symbol']}: {e}")
+                      current_price = 0.0
+                  
                   # Insert signal into database
                   insert_query = """
                   INSERT INTO trading_signals (
-                      symbol, signal_type, confidence, prediction, 
-                      model_version, timestamp, created_at
-                  ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                      timestamp, symbol, price, signal_type, model, confidence, 
+                      threshold, regime, model_version, features_used, xgboost_confidence,
+                      data_source, created_at, is_mock, processed, prediction
+                  ) VALUES (
+                      NOW(), %s, %s, %s, %s, %s, 
+                      0.8, 'bull', %s, 79, %s,
+                      'database', NOW(), 0, 0, %s
+                  )
                   """
                   
                   values = (
                       signal['symbol'],
+                      current_price,
                       signal['signal_type'],
+                      signal.get('model_version', 'xgboost_4h'),
                       signal['confidence'],
-                      signal['prediction'],
-                      signal['model_version'],
-                      datetime.now(),
-                      datetime.now()
+                      signal.get('model_version', 'xgboost_4h'),
+                      signal['confidence'],
+                      float(signal.get('prediction', 1.0))
                   )
                   
                   cursor.execute(insert_query, values)
                   conn.commit()
                   
                   signal_id = cursor.lastrowid
-                  logger.info(f"Signal saved to DB: ID {signal_id}, {signal['symbol']} {signal['signal_type']} (confidence: {signal['confidence']:.3f})")
+                  logger.info(f"Signal saved to DB: ID {signal_id}, {signal['symbol']} {signal['signal_type']} (confidence: {signal['confidence']:.3f}, price: {current_price})")
                   
                   return True
                   

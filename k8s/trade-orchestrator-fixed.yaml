@@ -1,0 +1,260 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trade-proc-orchestrator
+  namespace: crypto-trading
+  labels:
+    app: trade-proc-orchestrator
+    category: trade-processing
+    component: orchestrator
+    version: v1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trade-proc-orchestrator
+  template:
+    metadata:
+      labels:
+        app: trade-proc-orchestrator
+        category: trade-processing
+        component: orchestrator
+        version: v1
+    spec:
+      containers:
+      - name: trade-proc-orchestrator
+        image: python:3.11-slim
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8023
+          name: http
+          protocol: TCP
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          # Install dependencies
+          pip install fastapi uvicorn mysql-connector-python requests
+          
+          # Copy the automated live trader script
+          cat > /app/automated_live_trader.py << 'EOF'
+          #!/usr/bin/env python3
+          """
+          Automated Live Trader - Orchestrator Service
+          Processes trade recommendations and executes them
+          """
+          
+          import os
+          import time
+          import logging
+          import requests
+          from datetime import datetime, timedelta
+          from fastapi import FastAPI
+          import uvicorn
+          
+          # Configure logging
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s - %(levelname)s - %(message)s'
+          )
+          logger = logging.getLogger(__name__)
+          
+          # FastAPI app
+          app = FastAPI(title="Automated Live Trader")
+          
+          @app.get("/health")
+          def health_check():
+              return {
+                  "status": "healthy",
+                  "service": "automated_live_trader",
+                  "timestamp": datetime.now().isoformat()
+              }
+          
+          class AutomatedLiveTrader:
+              def __init__(self):
+                  self.recommendation_service_url = os.getenv('RECOMMENDATION_SERVICE_URL', 'http://localhost:8022')
+                  self.execution_service_url = os.getenv('EXECUTION_SERVICE_URL', 'http://localhost:8024')
+                  self.max_age_hours = int(os.getenv('MAX_AGE_HOURS', '1'))  
+                  self.check_interval = int(os.getenv('CHECK_INTERVAL', '30'))  
+                  self.max_trades_per_cycle = int(os.getenv('MAX_TRADES_PER_CYCLE', '3'))  
+              
+              def get_fresh_recommendations(self):
+                  """Get pending recommendations - FIXED TIME WINDOW & PRIORITIZATION"""
+                  try:
+                      import mysql.connector
+                      
+                      # Connect to database
+                      db_config = {
+                          'host': os.getenv('DB_HOST', '172.22.32.1'),
+                          'user': os.getenv('DB_USER', 'news_collector'),
+                          'password': os.getenv('DB_PASSWORD'),
+                          'database': 'crypto_prices'  # Use crypto_prices since we created the table there
+                      }
+                      
+                      conn = mysql.connector.connect(**db_config)
+                      cursor = conn.cursor(dictionary=True)
+                      
+                      # Process ALL pending recommendations, prioritizing recent high-confidence ones
+                      query = """
+                          SELECT id, symbol, signal_type, amount_usd, confidence, reasoning, created_at,
+                                 entry_price, stop_loss, take_profit, position_size_percent, amount_usd as amount_crypto
+                          FROM trade_recommendations 
+                          WHERE execution_status = 'PENDING' 
+                          AND is_mock = 0
+                          AND created_at >= (NOW() - INTERVAL 2 HOUR)
+                          ORDER BY 
+                              CASE WHEN reasoning LIKE '%STRATEGIC%' THEN 1 ELSE 2 END,
+                              confidence DESC, 
+                              created_at DESC 
+                          LIMIT %s
+                      """
+                      
+                      cursor.execute(query, (self.max_trades_per_cycle * 3,))  # Process more trades per cycle
+                      recommendations = cursor.fetchall()
+                      
+                      cursor.close()
+                      conn.close()
+                      
+                      logger.info(f"Found {len(recommendations)} pending recommendations (2h window, strategic priority)")
+                      return recommendations
+                      
+                  except Exception as e:
+                      logger.error(f"Failed to get fresh recommendations: {e}")
+                      return []
+              
+              def execute_recommendation(self, recommendation_id):
+                  """Execute a single recommendation via the trade execution engine"""
+                  try:
+                      url = f"{self.execution_service_url}/process_recommendation/{recommendation_id}"
+                      response = requests.post(url, timeout=30)
+                      response.raise_for_status()
+                      return response.json()
+                  except requests.exceptions.RequestException as e:
+                      logger.error(f"Failed to execute recommendation {recommendation_id}: {e}")
+                      if hasattr(e.response, 'text'):
+                          logger.error(f"Response: {e.response.text}")
+                      return {"status": "error", "message": str(e)}
+              
+              def process_recommendations(self):
+                  """Main processing loop"""
+                  try:
+                      logger.info("🔄 Starting recommendation processing cycle...")
+                      
+                      recommendations = self.get_fresh_recommendations()
+                      if not recommendations:
+                          logger.info("No pending recommendations found")
+                          return
+                      
+                      executed_count = 0
+                      for rec in recommendations:
+                          try:
+                              logger.info(f"Processing recommendation {rec['id']}: {rec['symbol']} {rec['signal_type']} (confidence: {rec['confidence']:.3f})")
+                              
+                              result = self.execute_recommendation(rec['id'])
+                              
+                              if result.get('status') == 'success':
+                                  executed_count += 1
+                                  logger.info(f"✅ Successfully executed recommendation {rec['id']}")
+                              else:
+                                  logger.error(f"❌ Failed to execute recommendation {rec['id']}: {result.get('message', 'Unknown error')}")
+                              
+                              # Limit trades per cycle
+                              if executed_count >= self.max_trades_per_cycle:
+                                  logger.info(f"Reached max trades per cycle ({self.max_trades_per_cycle})")
+                                  break
+                              
+                          except Exception as e:
+                              logger.error(f"Error processing recommendation {rec['id']}: {e}")
+                              continue
+                      
+                      logger.info(f"Recommendation processing cycle complete: {executed_count} trades executed")
+                      
+                  except Exception as e:
+                      logger.error(f"Error in recommendation processing cycle: {e}")
+              
+              def run(self):
+                  """Main execution loop"""
+                  logger.info("Starting Automated Live Trader...")
+                  while True:
+                      try:
+                          self.process_recommendations()
+                          time.sleep(self.check_interval)
+                      except Exception as e:
+                          logger.error(f"Error in main loop: {e}")
+                          time.sleep(60)  # Wait longer on error
+          
+          # Global trader instance
+          trader = AutomatedLiveTrader()
+          
+          @app.on_event("startup")
+          async def startup_event():
+              """Start the trader worker"""
+              import threading
+              worker_thread = threading.Thread(target=trader.run, daemon=True)
+              worker_thread.start()
+              logger.info("Automated Live Trader started")
+          
+          if __name__ == "__main__":
+              uvicorn.run(app, host="0.0.0.0", port=8023)
+          EOF
+          
+          # Start the service
+          python /app/automated_live_trader.py
+        envFrom:
+        - configMapRef:
+            name: trade-proc-orchestrator-config
+        env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: trade-exec-coinbase-secrets
+              key: DB_PASSWORD
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8023
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 10
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8023
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+        volumeMounts:
+        - mountPath: /app/logs
+          name: logs
+      volumes:
+      - emptyDir: {}
+        name: logs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trade-proc-orchestrator
+  namespace: crypto-trading
+  labels:
+    app: trade-proc-orchestrator
+spec:
+  selector:
+    app: trade-proc-orchestrator
+  ports:
+    - protocol: TCP
+      port: 8023
+      targetPort: 8023
+  type: ClusterIP

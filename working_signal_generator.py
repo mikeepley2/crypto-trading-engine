@@ -225,12 +225,15 @@ def generate_signal(symbol, features):
             confidence = max(probabilities)
             
             # Convert prediction to signal with optimized thresholds for balanced model
-            if prediction == 1 and confidence > 0.5:  # Buy signal with moderate confidence (27.5% positive class)
+            if prediction == 1 and confidence > 0.5:  # Buy signal with moderate confidence
                 signal_type = "BUY"
-            elif prediction == 0 and confidence > 0.6:  # Strong HOLD signal
-                signal_type = "HOLD"
+            elif prediction == 0 and confidence > 0.6:  # SELL signal with high confidence
+                signal_type = "SELL"
             else:
                 signal_type = "HOLD"  # Default to HOLD for low confidence
+            
+            # Debug: Log the prediction details
+            logger.info(f"Model prediction for {symbol}: prediction={prediction}, confidence={confidence:.3f}, signal_type={signal_type}")
             
             return {
                 'symbol': symbol,
@@ -258,12 +261,24 @@ def save_signal_to_db(signal):
         
         # Get current price for the symbol (required field)
         try:
-            price_query = "SELECT current_price FROM price_data WHERE symbol = %s ORDER BY timestamp DESC LIMIT 1"
+            price_query = "SELECT current_price FROM ml_features_materialized WHERE symbol = %s ORDER BY timestamp_iso DESC LIMIT 1"
             cursor.execute(price_query, (signal['symbol'],))
             price_result = cursor.fetchone()
-            current_price = float(price_result[0]) if price_result and price_result[0] else 0.0
-        except:
+            if price_result and price_result[0] is not None:
+                # Handle Decimal type from database
+                current_price = float(price_result[0])
+                logger.info(f"Got price for {signal['symbol']}: {current_price}")
+            else:
+                current_price = 0.0
+                logger.warning(f"No price data for {signal['symbol']}, using 0.0")
+        except Exception as e:
+            logger.warning(f"Could not get price for {signal['symbol']}: {e}")
             current_price = 0.0
+        
+        # Ensure current_price is a valid decimal
+        if current_price is None or current_price == '':
+            current_price = 0.0
+        current_price = float(current_price)
         
         query = """
         INSERT INTO trading_signals (
@@ -277,7 +292,8 @@ def save_signal_to_db(signal):
         )
         """
         
-        cursor.execute(query, (
+        # Debug: Log the values being inserted
+        insert_values = (
             signal['symbol'],                              # symbol
             current_price,                                 # price
             signal['signal_type'],                         # signal_type
@@ -286,7 +302,11 @@ def save_signal_to_db(signal):
             signal.get('model_version', 'xgboost_4h'),    # model_version
             signal['confidence'],                          # xgboost_confidence
             float(signal.get('prediction', 1.0))          # prediction
-        ))
+        )
+        
+        logger.info(f"Inserting signal for {signal['symbol']}: price={current_price}, type={signal['signal_type']}, confidence={signal['confidence']}")
+        
+        cursor.execute(query, insert_values)
         
         conn.commit()
         signal_id = cursor.lastrowid
@@ -407,11 +427,16 @@ def generate_signals_cycle():
                         logger.debug(f"Using fallback mode for {symbol} (insufficient features)")
                 
                 if signal and signal['signal_type'] != 'HOLD':
+                    logger.info(f"🔄 Attempting to save {signal['signal_type']} signal for {symbol}")
                     if save_signal_to_db(signal):
                         signals_generated += 1
                         logger.info(f"✅ Generated {signal['signal_type']} signal for {symbol} (confidence: {signal['confidence']:.3f})")
+                    else:
+                        logger.error(f"❌ Failed to save {signal['signal_type']} signal for {symbol}")
                 elif signal and signal['signal_type'] == 'HOLD':
-                    logger.debug(f"⚠️ Generated HOLD signal for {symbol} - not saved")
+                    logger.info(f"⚠️ Generated HOLD signal for {symbol} (confidence: {signal['confidence']:.3f}) - not saved")
+                else:
+                    logger.warning(f"❌ No signal generated for {symbol}")
                 
             except Exception as e:
                 logger.error(f"❌ Error processing {symbol}: {e}")

@@ -1,0 +1,716 @@
+# =============================================================================
+# CRYPTO TRADING SYSTEM - FIXED DEPLOYMENT (No Heredocs)
+# =============================================================================
+
+---
+# Signal Generator - ML-backed signal generation
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-generator
+  namespace: crypto-trading
+  labels:
+    app: signal-generator
+    component: signal-generation
+    version: final
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-generator
+  template:
+    metadata:
+      labels:
+        app: signal-generator
+        component: signal-generation
+        version: final
+    spec:
+      containers:
+      - name: signal-generator
+        image: python:3.11-slim
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8025
+          name: http
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          # Create app directory and models subdirectory
+          mkdir -p /app/models
+          
+          # Install dependencies
+          pip install fastapi uvicorn mysql-connector-python requests numpy pandas scikit-learn xgboost joblib python-multipart
+          
+          # Start the service with embedded code
+          python -c "
+          import os
+          import logging
+          import time
+          import json
+          import requests
+          import numpy as np
+          import pandas as pd
+          import joblib
+          import mysql.connector
+          from datetime import datetime, timedelta
+          from fastapi import FastAPI, HTTPException
+          import uvicorn
+          import threading
+          from decimal import Decimal
+          
+          # Configure logging
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s - %(levelname)s - %(message)s',
+              handlers=[
+                  logging.StreamHandler()
+              ]
+          )
+          logger = logging.getLogger(__name__)
+          
+          # Global variables for model and database connection
+          model = None
+          db_connection_pool = None
+          
+          # FastAPI app for health endpoint
+          app = FastAPI(title='Production Signal Generator')
+          
+          # --- Database Functions ---
+          def get_db_connection():
+              global db_connection_pool
+              if db_connection_pool is None:
+                  try:
+                      db_config = {
+                          'host': os.getenv('DB_HOST', '172.22.32.1'),
+                          'user': os.getenv('DB_USER', 'news_collector'),
+                          'password': os.getenv('DB_PASSWORD'),
+                          'database': os.getenv('DB_NAME_PRICES', 'crypto_prices')
+                      }
+                      db_connection_pool = mysql.connector.pooling.MySQLConnectionPool(
+                          pool_name='signal_generator_pool',
+                          pool_size=5,
+                          **db_config
+                      )
+                      logger.info('Database connection pool created successfully.')
+                  except Exception as e:
+                      logger.critical(f'CRITICAL: Failed to create database connection pool: {e}')
+                      return None
+              
+              try:
+                  return db_connection_pool.get_connection()
+              except Exception as e:
+                  logger.critical(f'CRITICAL: Failed to get connection from pool: {e}')
+                  return None
+          
+          # --- Model Loading ---
+          def load_model():
+              global model
+              model_path = '/app/models/balanced_realistic_model_20251005_155755.joblib'
+              try:
+                  model = joblib.load(model_path)
+                  logger.info(f'ML model loaded successfully from {model_path}')
+                  # Validate model by making a dummy prediction
+                  dummy_features = np.random.rand(1, 51) # Model expects 51 features
+                  model.predict(dummy_features)
+                  logger.info('ML model loaded and validated successfully.')
+                  return True
+              except Exception as e:
+                  logger.error(f'CRITICAL: Failed to load ML model from {model_path}: {e}')
+                  return False
+          
+          # --- Signal Generation Logic ---
+          def generate_signal(symbol, features):
+              global model
+              
+              if model is None:
+                  return None
+              
+              try:
+                  # ML model prediction
+                  if not hasattr(model, 'predict') or not hasattr(model, 'predict_proba'):
+                      logger.error(f'❌ ML model is not functional for {symbol}')
+                      return None
+                  
+                  try:
+                      prediction = model.predict(features)[0]
+                      probabilities = model.predict_proba(features)[0]
+                      confidence = max(probabilities)
+                      
+                      # Convert prediction to signal with optimized thresholds for balanced model
+                      if prediction == 1 and confidence > 0.5:  # Buy signal with moderate confidence
+                          signal_type = 'BUY'
+                      elif prediction == 0 and confidence > 0.6:  # SELL signal with high confidence
+                          signal_type = 'SELL'
+                      else:
+                          signal_type = 'HOLD'  # Default to HOLD for low confidence
+                      
+                      # Debug: Log the prediction details
+                      logger.info(f'Model prediction for {symbol}: prediction={prediction}, confidence={confidence:.3f}, signal_type={signal_type}')
+                      
+                      return {
+                          'symbol': symbol,
+                          'signal_type': signal_type,
+                          'confidence': float(confidence),  # Convert numpy float32 to Python float
+                          'prediction': int(prediction),    # Convert numpy int64 to Python int
+                          'model_version': 'xgboost_ml_model'
+                      }
+                  except Exception as e:
+                      logger.error(f'CRITICAL: ML model prediction failed for {symbol}: {e}')
+                      raise Exception(f'CRITICAL: ML model prediction failed for {symbol}: {e}')
+          
+          def save_signal_to_db(signal):
+              conn = get_db_connection()
+              if not conn:
+                  return False
+              
+              try:
+                  cursor = conn.cursor()
+                  
+                  # Get current price for the symbol (required field)
+                  try:
+                      price_query = 'SELECT current_price FROM ml_features_materialized WHERE symbol = %s ORDER BY timestamp_iso DESC LIMIT 1'
+                      cursor.execute(price_query, (signal['symbol'],))
+                      price_result = cursor.fetchone()
+                      if price_result and price_result[0] is not None:
+                          # Handle Decimal type from database
+                          current_price = float(price_result[0])
+                      else:
+                          current_price = 0.0
+                  except Exception as e:
+                      logger.warning(f'Could not get price for {signal[\"symbol\"]}: {e}')
+                      current_price = 0.0
+                  
+                  # Insert signal into database
+                  insert_query = '''
+                  INSERT INTO trading_signals (
+                      timestamp, symbol, price, signal_type, model, confidence, 
+                      threshold, regime, model_version, features_used, xgboost_confidence,
+                      data_source, created_at, is_mock, processed, prediction
+                  ) VALUES (
+                      NOW(), %s, %s, %s, %s, %s, 
+                      0.8, 'bull', %s, 79, %s,
+                      'database', NOW(), 0, 0, %s
+                  )
+                  '''
+                  
+                  values = (
+                      signal['symbol'],
+                      current_price,
+                      signal['signal_type'],
+                      signal.get('model_version', 'xgboost_4h'),
+                      signal['confidence'],
+                      signal.get('model_version', 'xgboost_4h'),
+                      signal['confidence'],
+                      float(signal.get('prediction', 1.0))
+                  )
+                  
+                  cursor.execute(insert_query, values)
+                  conn.commit()
+                  
+                  signal_id = cursor.lastrowid
+                  logger.info(f'Signal saved to DB: ID {signal_id}, {signal[\"symbol\"]} {signal[\"signal_type\"]} (confidence: {signal[\"confidence\"]:.3f}, price: {current_price})')
+                  
+                  return True
+                  
+              except Exception as e:
+                  logger.error(f'Error saving signal to database: {e}')
+                  return False
+              finally:
+                  if conn:
+                      conn.close()
+          
+          def get_active_symbols():
+              conn = get_db_connection()
+              if not conn:
+                  raise Exception('CRITICAL: Cannot get active symbols - database not connected')
+              
+              try:
+                  cursor = conn.cursor()
+                  # Prioritize symbols with recent data and filter out unsupported assets
+                  query = '''
+                      SELECT DISTINCT symbol 
+                      FROM ml_features_materialized 
+                      WHERE timestamp_iso >= NOW() - INTERVAL 30 MINUTE
+                      AND current_price IS NOT NULL AND current_price > 0
+                      ORDER BY timestamp_iso DESC
+                      LIMIT 50
+                  '''
+                  cursor.execute(query)
+                  results = cursor.fetchall()
+                  
+                  symbols = [row[0] for row in results]
+                  
+                  # Filter symbols through coinbase asset filter
+                  original_count = len(symbols)
+                  symbols = [s for s in symbols if is_asset_supported(s)]
+                  if len(symbols) < original_count:
+                      logger.info(f'Filtered out {original_count - len(symbols)} unsupported assets.')
+                  
+                  if not symbols:
+                      logger.warning('⚠️ No active symbols found in database after filtering.')
+                      return []
+                  
+                  logger.info(f'Found {len(symbols)} active symbols')
+                  return symbols
+              except Exception as e:
+                  logger.error(f'Error getting active symbols: {e}')
+                  return []
+              finally:
+                  if conn:
+                      conn.close()
+          
+          def get_features_for_symbol(symbol):
+              conn = get_db_connection()
+              if not conn:
+                  return None
+              
+              try:
+                  cursor = conn.cursor(dictionary=True)
+                  query = '''
+                  SELECT * FROM ml_features_materialized 
+                  WHERE symbol = %s 
+                  ORDER BY timestamp_iso DESC 
+                  LIMIT 1
+                  '''
+                  cursor.execute(query, (symbol,))
+                  result = cursor.fetchone()
+                  
+                  if result:
+                      # Exclude metadata columns
+                      excluded_columns = {
+                          'id', 'symbol', 'timestamp_iso', 'created_at', 'updated_at', 
+                          'current_price', 'volume_24h', 'rsi', 'crypto_sentiment', 'vix',
+                          'llm_analysis', 'llm_confidence', 'llm_reasoning', 'sentiment_boost',
+                          'sentiment_sources', 'sentiment_score', 'sentiment_confidence', 'prediction_timestamp',
+                          'prediction', 'is_mock', 'processed', 'signal_id', 'signal_strength', 'processed_at'
+                      }
+                      features = {k: v for k, v in result.items() if k not in excluded_columns}
+                      
+                      # Convert Decimal to float for features
+                      for k, v in features.items():
+                          if isinstance(v, Decimal):
+                              features[k] = float(v)
+                      
+                      # Ensure all 51 expected features are present, fill missing with 0.0
+                      expected_features_count = 51
+                      if len(features) < expected_features_count:
+                          logger.warning(f'Insufficient features ({len(features)}) for {symbol}, expected {expected_features_count}. Filling with 0.0.')
+                          return None 
+                      
+                      # Convert to DataFrame and then to numpy array for model prediction
+                      features_df = pd.DataFrame([features])
+                      return features_df.values
+                  return None
+              except Exception as e:
+                  logger.error(f'Error getting features for {symbol}: {e}')
+                  return None
+              finally:
+                  if conn:
+                      conn.close()
+          
+          def is_asset_supported(symbol):
+              supported_assets = [
+                  'BTC', 'ETH', 'ADA', 'DOGE', 'XRP', 'DOT', 'LINK', 'UNI', 'AAVE', 'SOL', 
+                  'MATIC', 'AVAX', 'LTC', 'BCH', 'ATOM', 'ICP', 'FIL', 'TRX', 'ETC', 'XLM',
+                  'VET', 'MKR', 'COMP', 'EOS', 'THETA', 'XTZ', 'YFI', 'SHIB', 'CRV', 'ALGO',
+                  'NEAR', 'OP', 'ARB', 'FLOKI', 'BONK', 'WIF', 'PEPE', 'SUSHI', 'PENGU', 'BRETT',
+                  'FARTCOIN', 'AST', 'BNB', 'CVX', 'DEXT'
+              ]
+              return symbol in supported_assets
+          
+          # --- Main Signal Generation Cycle ---
+          def generate_signals_cycle():
+              try:
+                  logger.info('🚀 Starting signal generation cycle...')
+                  
+                  symbols = get_active_symbols()
+                  if not symbols:
+                      logger.warning('⚠️ No active symbols found')
+                      return
+                  
+                  signals_generated = 0
+                  
+                  for symbol in symbols[:20]:  # Limit to top 20 symbols
+                      try:
+                          # Double-check asset support before generating signal
+                          if not is_asset_supported(symbol):
+                              logger.info(f'[ASSET_FILTER] Skipping signal generation for unsupported asset: {symbol}')
+                              continue
+                          
+                          signal = None
+                          features = get_features_for_symbol(symbol)
+                          
+                          if features is not None and features.shape[1] == 51:
+                              signal = generate_signal(symbol, features)
+                          else:
+                              logger.warning(f'Insufficient or invalid features for {symbol} ({features.shape[1] if features is not None else \"None\"} features). Skipping ML prediction.')
+                              # Fallback to a HOLD signal if features are insufficient
+                              signal = {
+                                  'symbol': symbol,
+                                  'signal_type': 'HOLD',
+                                  'confidence': 0.5,
+                                  'prediction': 0,
+                                  'model_version': 'fallback_hold'
+                              }
+                          
+                          if signal and signal['signal_type'] != 'HOLD':
+                              logger.info(f'🔄 Attempting to save {signal[\"signal_type\"]} signal for {symbol}')
+                              if save_signal_to_db(signal):
+                                  signals_generated += 1
+                                  logger.info(f'✅ Generated {signal[\"signal_type\"]} signal for {symbol} (confidence: {signal[\"confidence\"]:.3f})')
+                              else:
+                                  logger.error(f'❌ Failed to save {signal[\"signal_type\"]} signal for {symbol}')
+                          elif signal and signal['signal_type'] == 'HOLD':
+                              logger.info(f'⚠️ Generated HOLD signal for {symbol} (confidence: {signal[\"confidence\"]:.3f}) - not saved')
+                          else:
+                              logger.warning(f'❌ No signal generated for {symbol}')
+                          
+                      except Exception as e:
+                          logger.error(f'❌ Error processing {symbol}: {e}')
+                          continue
+                  
+                  logger.info(f'Signal generation cycle complete: {signals_generated} signals generated')
+                  
+              except Exception as e:
+                  logger.critical(f'CRITICAL: Error in signal generation cycle: {e}')
+          
+          # --- FastAPI Endpoints ---
+          @app.get('/health')
+          def health_check():
+              db_connected = False
+              try:
+                  conn = get_db_connection()
+                  if conn:
+                      db_connected = True
+                      conn.close()
+              except Exception:
+                  pass
+              
+              model_loaded = (model is not None and model != 'fallback')
+              
+              if model_loaded and db_connected:
+                  status = 'healthy'
+              elif not model_loaded:
+                  status = 'unhealthy - model not loaded'
+              elif not db_connected:
+                  status = 'unhealthy - database not connected'
+              else:
+                  status = 'unhealthy - unknown reason'
+              
+              return {
+                  'status': status,
+                  'model_loaded': model_loaded,
+                  'database_connected': db_connected,
+                  'timestamp': datetime.now().isoformat()
+              }
+          
+          @app.on_event('startup')
+          async def startup_event():
+              logger.info('Starting Production Signal Generator...')
+              if not load_model():
+                  logger.error('CRITICAL: No functional ML model could be loaded. Service will fail.')
+                  raise Exception('CRITICAL: No functional ML model could be loaded. Service cannot start without a valid model.')
+              
+              # Start signal generation in a background thread
+              logger.info('Starting signal generation worker...')
+              threading.Thread(target=lambda: schedule_signals(generate_signals_cycle, 300), daemon=True).start()
+              
+              logger.info('Production Signal Generator initialized successfully')
+          
+          def schedule_signals(func, interval):
+              while True:
+                  func()
+                  time.sleep(interval)
+          
+          if __name__ == '__main__':
+              uvicorn.run(app, host='0.0.0.0', port=8025)
+          "
+        envFrom:
+        - configMapRef:
+            name: trade-exec-coinbase-config
+        env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: trade-exec-coinbase-secrets
+              key: DB_PASSWORD
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8025
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8025
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-generator
+  namespace: crypto-trading
+  labels:
+    app: signal-generator
+    component: signal-generation
+spec:
+  selector:
+    app: signal-generator
+  ports:
+    - protocol: TCP
+      port: 8025
+      targetPort: 8025
+  type: ClusterIP
+
+---
+# Trade Orchestrator - Fixed version
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trade-orchestrator
+  namespace: crypto-trading
+  labels:
+    app: trade-orchestrator
+    component: orchestration
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trade-orchestrator
+  template:
+    metadata:
+      labels:
+        app: trade-orchestrator
+        component: orchestration
+    spec:
+      containers:
+      - name: trade-orchestrator
+        image: python:3.11-slim
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8023
+          name: http
+          protocol: TCP
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          # Install dependencies
+          pip install fastapi uvicorn mysql-connector-python requests
+          
+          # Start the service with embedded code
+          python -c "
+          import os
+          import time
+          import logging
+          import requests
+          from datetime import datetime, timedelta
+          from fastapi import FastAPI
+          import uvicorn
+          
+          # Configure logging
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s - %(levelname)s - %(message)s'
+          )
+          logger = logging.getLogger(__name__)
+          
+          # FastAPI app
+          app = FastAPI(title='Trade Orchestrator')
+          
+          @app.get('/health')
+          def health_check():
+              return {
+                  'status': 'healthy',
+                  'service': 'trade_orchestrator',
+                  'timestamp': datetime.now().isoformat()
+              }
+          
+          class TradeOrchestrator:
+              def __init__(self):
+                  self.recommendation_service_url = os.getenv('RECOMMENDATION_SERVICE_URL', 'http://signal-bridge:8022')
+                  self.execution_service_url = os.getenv('EXECUTION_SERVICE_URL', 'http://trade-executor:8024')
+                  self.max_age_hours = float(os.getenv('MAX_AGE_HOURS', '1'))  
+                  self.check_interval = int(os.getenv('CHECK_INTERVAL', '30'))  
+                  self.max_trades_per_cycle = int(os.getenv('MAX_TRADES_PER_CYCLE', '3'))  
+              
+              def get_fresh_recommendations(self):
+                  try:
+                      import mysql.connector
+                      
+                      # Connect to database
+                      db_config = {
+                          'host': os.getenv('DB_HOST', '172.22.32.1'),
+                          'user': os.getenv('DB_USER', 'news_collector'),
+                          'password': os.getenv('DB_PASSWORD'),
+                          'database': 'crypto_prices'
+                      }
+                      
+                      conn = mysql.connector.connect(**db_config)
+                      cursor = conn.cursor(dictionary=True)
+                      
+                      # Process ALL pending recommendations, prioritizing recent high-confidence ones
+                      query = '''
+                          SELECT id, symbol, signal_type, amount_usd, confidence, reasoning, created_at,
+                                 entry_price, stop_loss, take_profit, position_size_percent, amount_usd as amount_crypto
+                          FROM trade_recommendations 
+                          WHERE execution_status = 'PENDING' 
+                          AND is_mock = 0
+                          AND created_at >= (NOW() - INTERVAL 2 HOUR)
+                          ORDER BY 
+                              CASE WHEN reasoning LIKE '%STRATEGIC%' THEN 1 ELSE 2 END,
+                              confidence DESC, 
+                              created_at DESC 
+                          LIMIT %s
+                      '''
+                      
+                      cursor.execute(query, (self.max_trades_per_cycle * 3,))
+                      recommendations = cursor.fetchall()
+                      
+                      cursor.close()
+                      conn.close()
+                      
+                      logger.info(f'Found {len(recommendations)} pending recommendations (2h window, strategic priority)')
+                      return recommendations
+                      
+                  except Exception as e:
+                      logger.error(f'Failed to get fresh recommendations: {e}')
+                      return []
+              
+              def execute_recommendation(self, recommendation_id):
+                  try:
+                      url = f'{self.execution_service_url}/process_recommendation/{recommendation_id}'
+                      response = requests.post(url, timeout=30)
+                      response.raise_for_status()
+                      return response.json()
+                  except requests.exceptions.RequestException as e:
+                      logger.error(f'Failed to execute recommendation {recommendation_id}: {e}')
+                      if hasattr(e.response, 'text'):
+                          logger.error(f'Response: {e.response.text}')
+                      return {'status': 'error', 'message': str(e)}
+              
+              def process_recommendations(self):
+                  try:
+                      logger.info('🔄 Starting recommendation processing cycle...')
+                      
+                      recommendations = self.get_fresh_recommendations()
+                      if not recommendations:
+                          logger.info('No pending recommendations found')
+                          return
+                      
+                      executed_count = 0
+                      for rec in recommendations:
+                          try:
+                              logger.info(f'Processing recommendation {rec[\"id\"]}: {rec[\"symbol\"]} {rec[\"signal_type\"]} (confidence: {rec[\"confidence\"]:.3f})')
+                              
+                              result = self.execute_recommendation(rec['id'])
+                              
+                              if result.get('status') == 'success':
+                                  executed_count += 1
+                                  logger.info(f'✅ Successfully executed recommendation {rec[\"id\"]}')
+                              else:
+                                  logger.error(f'❌ Failed to execute recommendation {rec[\"id\"]}: {result.get(\"message\", \"Unknown error\")}')
+                              
+                              # Limit trades per cycle
+                              if executed_count >= self.max_trades_per_cycle:
+                                  logger.info(f'Reached max trades per cycle ({self.max_trades_per_cycle})')
+                                  break
+                              
+                          except Exception as e:
+                              logger.error(f'Error processing recommendation {rec[\"id\"]}: {e}')
+                              continue
+                      
+                      logger.info(f'Recommendation processing cycle complete: {executed_count} trades executed')
+                      
+                  except Exception as e:
+                      logger.error(f'Error in recommendation processing cycle: {e}')
+              
+              def run(self):
+                  logger.info('Starting Trade Orchestrator...')
+                  while True:
+                      try:
+                          self.process_recommendations()
+                          time.sleep(self.check_interval)
+                      except Exception as e:
+                          logger.error(f'Error in main loop: {e}')
+                          time.sleep(60)  # Wait longer on error
+          
+          # Global orchestrator instance
+          orchestrator = TradeOrchestrator()
+          
+          @app.on_event('startup')
+          async def startup_event():
+              import threading
+              worker_thread = threading.Thread(target=orchestrator.run, daemon=True)
+              worker_thread.start()
+              logger.info('Trade Orchestrator started')
+          
+          if __name__ == '__main__':
+              uvicorn.run(app, host='0.0.0.0', port=8023)
+          "
+        envFrom:
+        - configMapRef:
+            name: trade-proc-orchestrator-config
+        env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: trade-exec-coinbase-secrets
+              key: DB_PASSWORD
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8023
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 10
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8023
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trade-orchestrator
+  namespace: crypto-trading
+  labels:
+    app: trade-orchestrator
+spec:
+  selector:
+    app: trade-orchestrator
+  ports:
+    - protocol: TCP
+      port: 8023
+      targetPort: 8023
+  type: ClusterIP

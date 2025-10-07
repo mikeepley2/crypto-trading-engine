@@ -1,0 +1,182 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-validation-script
+  namespace: crypto-trading
+data:
+  llm_service.py: |
+    import os
+    import logging
+    import time
+    import json
+    import requests
+    import aiohttp
+    import asyncio
+    import mysql.connector
+    from datetime import datetime, timedelta
+    from fastapi import FastAPI, HTTPException
+    import uvicorn
+    import threading
+
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+
+    app = FastAPI(title='LLM Validation Service - NO FALLBACK')
+    OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://ollama:11434')
+    DEFAULT_MODEL = os.getenv('OLLAMA_DEFAULT_MODEL', 'phi3:3.8b')
+
+    def get_db_connection():
+        try:
+            db_config = {
+                'host': os.getenv('DB_HOST', '172.22.32.1'),
+                'user': os.getenv('DB_USER', 'news_collector'),
+                'password': os.getenv('DB_PASSWORD'),
+                'database': os.getenv('DB_NAME_PRICES', 'crypto_prices')
+            }
+            return mysql.connector.connect(**db_config)
+        except Exception as e:
+            logger.error(f'Database connection failed: {e}')
+            raise Exception(f'Database connection failed: {e}')
+
+    async def check_ollama_models():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f'{OLLAMA_URL}/api/tags', timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        models = [model['name'] for model in data.get('models', [])]
+                        logger.info(f'Available Ollama models: {models}')
+                        return models
+                    else:
+                        logger.error(f'Failed to get Ollama models: {response.status}')
+                        raise Exception(f'Ollama API error: {response.status}')
+        except Exception as e:
+            logger.error(f'Error checking Ollama models: {e}')
+            raise Exception(f'Cannot connect to Ollama: {e}')
+
+    @app.get('/health')
+    def health_check():
+        return {
+            'status': 'healthy',
+            'service': 'llm_validation_no_fallback',
+            'ollama_url': OLLAMA_URL,
+            'default_model': DEFAULT_MODEL,
+            'timestamp': datetime.now().isoformat()
+        }
+
+    @app.get('/status')
+    def get_status():
+        return {
+            'status': 'healthy',
+            'ollama_url': OLLAMA_URL,
+            'model': DEFAULT_MODEL,
+            'timestamp': datetime.now().isoformat()
+        }
+
+    @app.on_event('startup')
+    async def startup_event():
+        logger.info('Starting LLM Validation Service - NO FALLBACK MODE...')
+        
+        try:
+            available_models = await check_ollama_models()
+            if available_models:
+                logger.info(f'Connected to Ollama with models: {available_models}')
+            else:
+                raise Exception('No Ollama models available - system cannot start')
+        except Exception as e:
+            logger.error(f'Failed to connect to Ollama: {e}')
+            raise Exception(f'Cannot start without Ollama: {e}')
+        
+        logger.info('LLM Validation Service started - NO FALLBACK MODE')
+
+    if __name__ == '__main__':
+        uvicorn.run(app, host='0.0.0.0', port=8050)
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-validation-service
+  namespace: crypto-trading
+  labels:
+    app: llm-validation-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-validation-service
+  template:
+    metadata:
+      labels:
+        app: llm-validation-service
+    spec:
+      containers:
+      - name: llm-validation-service
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8050
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install fastapi uvicorn mysql-connector-python requests aiohttp
+          python /app/llm_service.py
+        envFrom:
+        - configMapRef:
+            name: trade-exec-coinbase-config
+        env:
+        - name: OLLAMA_URL
+          value: "http://ollama:11434"
+        - name: OLLAMA_DEFAULT_MODEL
+          value: "phi3:3.8b"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: trade-exec-coinbase-secrets
+              key: DB_PASSWORD
+        volumeMounts:
+        - name: llm-script
+          mountPath: /app/llm_service.py
+          subPath: llm_service.py
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8050
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8050
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+      volumes:
+      - name: llm-script
+        configMap:
+          name: llm-validation-script
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-validation-service
+  namespace: crypto-trading
+spec:
+  selector:
+    app: llm-validation-service
+  ports:
+  - name: http
+    port: 8050
+    targetPort: 8050
+  type: ClusterIP

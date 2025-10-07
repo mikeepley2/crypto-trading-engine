@@ -1,0 +1,255 @@
+# =============================================================================
+# TRADE ORCHESTRATOR WITH LLM VALIDATION
+# =============================================================================
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trade-orchestrator-llm
+  namespace: crypto-trading
+  labels:
+    app: trade-orchestrator-llm
+    component: orchestration
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trade-orchestrator-llm
+  template:
+    metadata:
+      labels:
+        app: trade-orchestrator-llm
+        component: orchestration
+    spec:
+      containers:
+      - name: trade-orchestrator-llm
+        image: python:3.11-slim
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8023
+          name: http
+          protocol: TCP
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          # Install dependencies
+          pip install fastapi uvicorn mysql-connector-python requests
+          
+          # Start the service with embedded code
+          python -c "
+          import os
+          import time
+          import logging
+          import requests
+          import mysql.connector
+          from datetime import datetime, timedelta
+          from fastapi import FastAPI
+          import uvicorn
+          
+          # Configure logging
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s - %(levelname)s - %(message)s'
+          )
+          logger = logging.getLogger(__name__)
+          
+          # FastAPI app
+          app = FastAPI(title='Trade Orchestrator with LLM Validation')
+          
+          @app.get('/health')
+          def health_check():
+              return {
+                  'status': 'healthy',
+                  'service': 'trade_orchestrator_llm',
+                  'timestamp': datetime.now().isoformat()
+              }
+          
+          class TradeOrchestratorLLM:
+              def __init__(self):
+                  self.recommendation_service_url = os.getenv('RECOMMENDATION_SERVICE_URL', 'http://signal-bridge:8022')
+                  self.execution_service_url = os.getenv('EXECUTION_SERVICE_URL', 'http://trade-executor:8024')
+                  self.llm_validation_url = os.getenv('LLM_VALIDATION_URL', 'http://llm-validation-service:8026')
+                  self.max_age_hours = float(os.getenv('MAX_AGE_HOURS', '0.5'))  # 30 minutes
+                  self.check_interval = int(os.getenv('CHECK_INTERVAL', '30'))  
+                  self.max_trades_per_cycle = int(os.getenv('MAX_TRADES_PER_CYCLE', '3'))  
+              
+              def get_db_connection(self):
+                  try:
+                      db_config = {
+                          'host': os.getenv('DB_HOST', '172.22.32.1'),
+                          'user': os.getenv('DB_USER', 'news_collector'),
+                          'password': os.getenv('DB_PASSWORD'),
+                          'database': 'crypto_prices'
+                      }
+                      return mysql.connector.connect(**db_config)
+                  except Exception as e:
+                      logger.error(f'Database connection failed: {e}')
+                      return None
+              
+              def get_llm_approved_recommendations(self):
+                  conn = self.get_db_connection()
+                  if not conn:
+                      return []
+                  
+                  try:
+                      cursor = conn.cursor(dictionary=True)
+                      
+                      # Get recommendations that are LLM approved and pending execution
+                      query = '''
+                          SELECT id, symbol, signal_type, amount_usd, confidence, reasoning, created_at,
+                                 entry_price, stop_loss, take_profit, position_size_percent, 
+                                 llm_validation, llm_confidence, llm_reasoning, risk_assessment, suggested_amount
+                          FROM trade_recommendations 
+                          WHERE execution_status = 'PENDING' 
+                          AND llm_validation = 'APPROVE'
+                          AND is_mock = 0
+                          AND created_at >= (NOW() - INTERVAL %s HOUR)
+                          ORDER BY 
+                              llm_confidence DESC,
+                              confidence DESC, 
+                              created_at DESC 
+                          LIMIT %s
+                      '''
+                      
+                      cursor.execute(query, (self.max_age_hours, self.max_trades_per_cycle * 2))
+                      recommendations = cursor.fetchall()
+                      
+                      logger.info(f'Found {len(recommendations)} LLM-approved recommendations ({self.max_age_hours}h window)')
+                      return recommendations
+                  except Exception as e:
+                      logger.error(f'Failed to get LLM-approved recommendations: {e}')
+                      return []
+                  finally:
+                      if conn:
+                          conn.close()
+              
+              def execute_recommendation(self, recommendation_id):
+                  try:
+                      url = f'{self.execution_service_url}/process_recommendation/{recommendation_id}'
+                      logger.info(f'Executing LLM-approved recommendation {recommendation_id} via {url}')
+                      response = requests.post(url, timeout=30)
+                      response.raise_for_status()
+                      return response.json()
+                  except requests.exceptions.RequestException as e:
+                      logger.error(f'Failed to execute recommendation {recommendation_id}: {e}')
+                      if hasattr(e, 'response') and e.response:
+                          logger.error(f'Response: {e.response.text}')
+                      return {'status': 'error', 'message': str(e)}
+              
+              def process_llm_approved_recommendations(self):
+                  try:
+                      logger.info('🔄 Starting LLM-approved recommendation processing cycle...')
+                      
+                      recommendations = self.get_llm_approved_recommendations()
+                      if not recommendations:
+                          logger.info('No LLM-approved recommendations found')
+                          return
+                      
+                      executed_count = 0
+                      for rec in recommendations:
+                          try:
+                              logger.info(f'Processing LLM-approved recommendation {rec[\"id\"]}: {rec[\"symbol\"]} {rec[\"signal_type\"]} (LLM confidence: {rec[\"llm_confidence\"]:.3f}, ML confidence: {rec[\"confidence\"]:.3f})')
+                              logger.info(f'  LLM Reasoning: {rec[\"llm_reasoning\"]}')
+                              logger.info(f'  Risk Assessment: {rec[\"risk_assessment\"]}')
+                              
+                              result = self.execute_recommendation(rec['id'])
+                              
+                              if result.get('status') == 'success':
+                                  executed_count += 1
+                                  logger.info(f'✅ Successfully executed LLM-approved recommendation {rec[\"id\"]}')
+                              else:
+                                  logger.error(f'❌ Failed to execute LLM-approved recommendation {rec[\"id\"]}: {result.get(\"message\", \"Unknown error\")}')
+                              
+                              # Limit trades per cycle
+                              if executed_count >= self.max_trades_per_cycle:
+                                  logger.info(f'Reached max trades per cycle ({self.max_trades_per_cycle})')
+                                  break
+                              
+                          except Exception as e:
+                              logger.error(f'Error processing LLM-approved recommendation {rec[\"id\"]}: {e}')
+                              continue
+                      
+                      logger.info(f'LLM-approved recommendation processing cycle complete: {executed_count} trades executed')
+                      
+                  except Exception as e:
+                      logger.error(f'Error in LLM-approved recommendation processing cycle: {e}')
+              
+              def run(self):
+                  logger.info('Starting Trade Orchestrator with LLM Validation...')
+                  while True:
+                      try:
+                          self.process_llm_approved_recommendations()
+                          time.sleep(self.check_interval)
+                      except Exception as e:
+                          logger.error(f'Error in main loop: {e}')
+                          time.sleep(60)  # Wait longer on error
+          
+          # Global orchestrator instance
+          orchestrator = TradeOrchestratorLLM()
+          
+          @app.on_event('startup')
+          async def startup_event():
+              import threading
+              worker_thread = threading.Thread(target=orchestrator.run, daemon=True)
+              worker_thread.start()
+              logger.info('Trade Orchestrator with LLM Validation started')
+          
+          if __name__ == '__main__':
+              uvicorn.run(app, host='0.0.0.0', port=8023)
+          "
+        envFrom:
+        - configMapRef:
+            name: trade-proc-orchestrator-config
+        env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: trade-exec-coinbase-secrets
+              key: DB_PASSWORD
+        - name: LLM_VALIDATION_URL
+          value: "http://llm-validation-service:8026"
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8023
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 10
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8023
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trade-orchestrator-llm
+  namespace: crypto-trading
+  labels:
+    app: trade-orchestrator-llm
+spec:
+  selector:
+    app: trade-orchestrator-llm
+  ports:
+    - protocol: TCP
+      port: 8023
+      targetPort: 8023
+  type: ClusterIP

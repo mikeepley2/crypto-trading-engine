@@ -23,6 +23,7 @@ crypto_prices       # ML features and historical data
 
 ### API Credentials
 - **Coinbase Advanced Trade API**: API key and private key in EC format
+- **⚠️ CRITICAL**: See [Coinbase API Authentication Guide](COINBASE_API_AUTHENTICATION.md) for proper setup
 - **Optional**: Binance.US, KuCoin API credentials for multi-platform trading
 
 ## Deployment Steps
@@ -231,6 +232,9 @@ kubectl logs -n crypto-trading deployment/trade-execution | grep -i "api\|error"
 
 # Verify API key configuration
 kubectl get secret coinbase-api -n crypto-trading -o yaml
+
+# ⚠️ CRITICAL: Check authentication method
+# See COINBASE_API_AUTHENTICATION.md for troubleshooting 401 errors
 ```
 
 #### Portfolio Sync Issues

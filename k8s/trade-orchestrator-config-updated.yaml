@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trade-proc-orchestrator-config
+  namespace: crypto-trading
+  labels:
+    app: trade-proc-orchestrator
+    category: trade-processing
+    component: orchestrator
+data:
+  CHECK_INTERVAL: "30"
+  EXECUTION_SERVICE_URL: "http://trade-executor:8024"
+  LOG_LEVEL: "INFO"
+  MAX_AGE_HOURS: "0.5"  # 30 minutes
+  MAX_TRADES_PER_CYCLE: "3"
+  RECOMMENDATION_SERVICE_URL: "http://signal-bridge:8022"

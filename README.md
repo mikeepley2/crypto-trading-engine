@@ -47,7 +47,7 @@ kubectl create namespace crypto-ecosystem
 - **Message Bus**: Redis for cross-node communication and real-time data streams
 - **ML Models**: Centralized in `e:\git\aitest\ml_models_production\` directory
 
-## 🏗️ **Multi-Platform Trading Architecture**ecture**
+## 🏗️ **Multi-Platform Trading Architecture**
 This trading engine operates as part of a **4-node distributed AI crypto ecosystem**, each project serving specialized functions:
 
 #### **Node 1: aitest** (`e:\git\aitest`) 🧠 **ORCHESTRATION HUB**
@@ -212,10 +212,21 @@ crypto-trading-engine/
 │   └── monitoring/                    # Monitoring and health checks
 ├── shared/                            # Database schemas and migrations
 ├── docs/                              # Documentation
+│   ├── COINBASE_API_AUTHENTICATION.md  # ⚠️ CRITICAL: API auth setup
+│   ├── COINBASE_AUTH_QUICK_REFERENCE.md # Quick auth reference
+│   ├── DEPLOYMENT_GUIDE.md             # Complete deployment guide
+│   └── API.md                          # API documentation
 └── README.md                          # This file
 ```
 
 ## 🚀 **Quick Start - Live Trading System**
+
+### **⚠️ CRITICAL: API Authentication Setup**
+**BEFORE DEPLOYING**: Read [Coinbase API Authentication Guide](docs/COINBASE_API_AUTHENTICATION.md)
+- **MUST USE**: JWT authentication (not HMAC)
+- **MUST USE**: Correct endpoint: `https://api.coinbase.com/api/v3/brokerage`
+- **MUST USE**: Proper PEM format with actual newlines
+- **Quick Reference**: [COINBASE_AUTH_QUICK_REFERENCE.md](docs/COINBASE_AUTH_QUICK_REFERENCE.md)
 
 ### **1. Prerequisites**
 ```bash
