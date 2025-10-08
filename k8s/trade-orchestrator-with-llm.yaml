@@ -71,7 +71,7 @@ spec:
                   self.recommendation_service_url = os.getenv('RECOMMENDATION_SERVICE_URL', 'http://signal-bridge:8022')
                   self.execution_service_url = os.getenv('EXECUTION_SERVICE_URL', 'http://trade-executor:8024')
                   self.llm_validation_url = os.getenv('LLM_VALIDATION_URL', 'http://llm-validation-service:8026')
-                  self.max_age_hours = float(os.getenv('MAX_AGE_HOURS', '0.5'))  # 30 minutes
+                  self.max_age_hours = float(os.getenv('MAX_AGE_HOURS', '2.0'))  # 2 hours
                   self.check_interval = int(os.getenv('CHECK_INTERVAL', '30'))  
                   self.max_trades_per_cycle = int(os.getenv('MAX_TRADES_PER_CYCLE', '3'))  
               
@@ -107,6 +107,7 @@ spec:
                           AND is_mock = 0
                           AND created_at >= (NOW() - INTERVAL %s HOUR)
                           ORDER BY 
+                              CASE WHEN reasoning LIKE '%STRATEGIC%' THEN 1 ELSE 2 END,
                               llm_confidence DESC,
                               confidence DESC, 
                               created_at DESC 
@@ -116,7 +117,7 @@ spec:
                       cursor.execute(query, (self.max_age_hours, self.max_trades_per_cycle * 2))
                       recommendations = cursor.fetchall()
                       
-                      logger.info(f'Found {len(recommendations)} LLM-approved recommendations ({self.max_age_hours}h window)')
+                      logger.info(f'Found {len(recommendations)} LLM-approved recommendations ({self.max_age_hours}h window, strategic priority)')
                       return recommendations
                   except Exception as e:
                       logger.error(f'Failed to get LLM-approved recommendations: {e}')
