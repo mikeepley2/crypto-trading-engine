@@ -1,0 +1,95 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: signal-generator-monitor
+  namespace: monitoring
+  labels:
+    app: signal-generator
+spec:
+  selector:
+    matchLabels:
+      app: signal-generator-working
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: trade-executor-monitor
+  namespace: monitoring
+  labels:
+    app: trade-executor
+spec:
+  selector:
+    matchLabels:
+      app: trade-executor-real
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: llm-validation-monitor
+  namespace: monitoring
+  labels:
+    app: llm-validation
+spec:
+  selector:
+    matchLabels:
+      app: ollama-llm-validation
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: trade-orchestrator-monitor
+  namespace: monitoring
+  labels:
+    app: trade-orchestrator
+spec:
+  selector:
+    matchLabels:
+      app: trade-orchestrator-llm
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: risk-management-monitor
+  namespace: monitoring
+  labels:
+    app: risk-management
+spec:
+  selector:
+    matchLabels:
+      app: risk-management-service
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: health-monitor
+  namespace: monitoring
+  labels:
+    app: health-monitor
+spec:
+  selector:
+    matchLabels:
+      app: health-monitor
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s

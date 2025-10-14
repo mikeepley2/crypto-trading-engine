@@ -1,5 +1,11 @@
 # Crypto Trading Engine ⚡ **LIVE PRODUCTION SYSTEM**
 
+## 📚 **Documentation**
+
+- **[Complete Pipeline Documentation](CRYPTO_TRADING_PIPELINE_DOCUMENTATION.md)** - Comprehensive system overview
+- **[Pipeline Flow Diagram](PIPELINE_FLOW_DIAGRAM.md)** - Visual flow diagrams and data transformations
+- **[Quick Reference Guide](QUICK_REFERENCE_GUIDE.md)** - Operational commands and troubleshooting
+
 ## 🌐 **Multi-Project Ecosystem Architecture**
 
 ### **🔗 Distributed Node Architecture**

@@ -1,0 +1,321 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risk-management-service
+  namespace: crypto-trading
+  labels:
+    app: risk-management-service
+    component: risk-management
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: risk-management-service
+  template:
+    metadata:
+      labels:
+        app: risk-management-service
+        component: risk-management
+    spec:
+      containers:
+      - name: risk-management-service
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8027
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          # Install dependencies
+          pip install fastapi uvicorn requests mysql-connector-python pandas numpy scikit-learn
+          
+          # Create the risk management service
+          python -c "
+          import os
+          import time
+          import json
+          import logging
+          import mysql.connector
+          import pandas as pd
+          import numpy as np
+          from datetime import datetime, timedelta
+          from typing import Dict, Any, Optional, List
+          from fastapi import FastAPI, HTTPException
+          from pydantic import BaseModel
+          
+          # Configure logging
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+          logger = logging.getLogger(__name__)
+          
+          app = FastAPI(title='Risk Management Service', version='1.0.0')
+          
+          # Database configuration
+          DB_HOST = os.getenv('DB_HOST', '172.22.32.1')
+          DB_USER = os.getenv('DB_USER', 'news_collector')
+          DB_PASSWORD = os.getenv('DB_PASSWORD', '99Rules!')
+          DB_NAME = os.getenv('DB_NAME', 'crypto_prices')
+          
+          def get_db_connection():
+              return mysql.connector.connect(
+                  host=DB_HOST,
+                  user=DB_USER,
+                  password=DB_PASSWORD,
+                  database=DB_NAME
+              )
+          
+          # Pydantic models
+          class TradeCheck(BaseModel):
+              symbol: str
+              side: str
+              amount: float
+              portfolio_value: float
+              existing_positions: int
+          
+          class RiskAssessment(BaseModel):
+              symbol: str
+              side: str
+              amount: float
+              confidence: float
+              current_price: float
+          
+          class RiskResult(BaseModel):
+              approved: bool
+              risk_score: float
+              max_position_size: float
+              recommended_amount: float
+              risk_factors: List[str]
+              warnings: List[str]
+          
+          def calculate_volatility(symbol: str, days: int = 14) -> float:
+              '''Calculate 14-day volatility for position sizing'''
+              try:
+                  conn = get_db_connection()
+                  cursor = conn.cursor()
+                  
+                  # Get recent price data
+                  query = '''
+                      SELECT price, timestamp_iso 
+                      FROM crypto_prices 
+                      WHERE symbol = %s 
+                      AND timestamp_iso >= NOW() - INTERVAL %s DAY
+                      ORDER BY timestamp_iso DESC
+                      LIMIT 100
+                  '''
+                  cursor.execute(query, (symbol, days))
+                  prices = cursor.fetchall()
+                  
+                  if len(prices) < 2:
+                      return 0.3  # Default volatility
+                  
+                  # Calculate daily returns
+                  prices_df = pd.DataFrame(prices, columns=['price', 'timestamp'])
+                  prices_df['price'] = pd.to_numeric(prices_df['price'])
+                  prices_df['returns'] = prices_df['price'].pct_change().dropna()
+                  
+                  # Calculate annualized volatility
+                  volatility = prices_df['returns'].std() * np.sqrt(365)
+                  
+                  conn.close()
+                  return min(max(volatility, 0.1), 2.0)  # Bound between 10% and 200%
+                  
+              except Exception as e:
+                  logger.error(f'Error calculating volatility for {symbol}: {e}')
+                  return 0.3  # Default volatility
+          
+          def calculate_portfolio_heat() -> float:
+              '''Calculate current portfolio heat (risk exposure)'''
+              try:
+                  conn = get_db_connection()
+                  cursor = conn.cursor()
+                  
+                  # Get current positions from trade_recommendations
+                  query = '''
+                      SELECT symbol, amount_usd, confidence
+                      FROM trade_recommendations 
+                      WHERE execution_status = 'EXECUTED'
+                      AND executed_at >= NOW() - INTERVAL 7 DAY
+                  '''
+                  cursor.execute(query)
+                  positions = cursor.fetchall()
+                  
+                  if not positions:
+                      return 0.0
+                  
+                  total_value = sum(pos[1] for pos in positions)
+                  if total_value == 0:
+                      return 0.0
+                  
+                  # Calculate weighted risk exposure
+                  heat = 0.0
+                  for symbol, amount, confidence in positions:
+                      weight = amount / total_value
+                      volatility = calculate_volatility(symbol)
+                      risk_contribution = weight * volatility * confidence
+                      heat += risk_contribution
+                  
+                  conn.close()
+                  return min(heat, 1.0)  # Cap at 100%
+                  
+              except Exception as e:
+                  logger.error(f'Error calculating portfolio heat: {e}')
+                  return 0.0
+          
+          def assess_trade_risk(assessment: RiskAssessment) -> RiskResult:
+              '''Comprehensive risk assessment for a trade'''
+              try:
+                  risk_factors = []
+                  warnings = []
+                  
+                  # Calculate volatility-based position sizing
+                  volatility = calculate_volatility(assessment.symbol)
+                  
+                  # Base position size (2% of portfolio per trade)
+                  base_size = assessment.amount * 0.02
+                  
+                  # Volatility adjustment (higher volatility = smaller position)
+                  volatility_multiplier = max(0.3, min(2.0, 1.0 / volatility))
+                  adjusted_size = base_size * volatility_multiplier
+                  
+                  # Portfolio heat check
+                  current_heat = calculate_portfolio_heat()
+                  max_heat = 0.25  # 25% maximum portfolio heat
+                  
+                  if current_heat > max_heat:
+                      heat_reduction = max_heat / current_heat
+                      adjusted_size *= heat_reduction
+                      warnings.append(f'Portfolio heat ({current_heat:.1%}) exceeds limit, reducing position size')
+                  
+                  # Confidence adjustment
+                  confidence_multiplier = assessment.confidence
+                  final_size = adjusted_size * confidence_multiplier
+                  
+                  # Risk score calculation
+                  risk_score = volatility * (1 - assessment.confidence) * (1 + current_heat)
+                  
+                  # Approval logic
+                  approved = (
+                      risk_score < 0.5 and  # Low risk score
+                      final_size >= assessment.amount * 0.1 and  # At least 10% of requested
+                      current_heat < 0.3  # Portfolio heat under 30%
+                  )
+                  
+                  if not approved:
+                      risk_factors.append(f'High risk score: {risk_score:.3f}')
+                      if current_heat >= 0.3:
+                          risk_factors.append(f'High portfolio heat: {current_heat:.1%}')
+                      if final_size < assessment.amount * 0.1:
+                          risk_factors.append(f'Position too small: {final_size:.2f} < {assessment.amount * 0.1:.2f}')
+                  
+                  return RiskResult(
+                      approved=approved,
+                      risk_score=risk_score,
+                      max_position_size=final_size,
+                      recommended_amount=min(final_size, assessment.amount),
+                      risk_factors=risk_factors,
+                      warnings=warnings
+                  )
+                  
+              except Exception as e:
+                  logger.error(f'Error in risk assessment: {e}')
+                  return RiskResult(
+                      approved=False,
+                      risk_score=1.0,
+                      max_position_size=0.0,
+                      recommended_amount=0.0,
+                      risk_factors=[f'Risk assessment error: {str(e)}'],
+                      warnings=[]
+                  )
+          
+          @app.get('/health')
+          async def health():
+              try:
+                  # Test database connection
+                  conn = get_db_connection()
+                  conn.close()
+                  
+                  return {
+                      'status': 'healthy',
+                      'service': 'risk-management',
+                      'timestamp': datetime.now().isoformat()
+                  }
+              except Exception as e:
+                  return {
+                      'status': 'unhealthy',
+                      'error': str(e),
+                      'timestamp': datetime.now().isoformat()
+                  }
+          
+          @app.post('/assess-risk', response_model=RiskResult)
+          async def assess_risk(assessment: RiskAssessment):
+              '''Assess risk for a proposed trade'''
+              logger.info(f'Risk assessment requested for {assessment.symbol} {assessment.side} ${assessment.amount}')
+              
+              result = assess_trade_risk(assessment)
+              
+              logger.info(f'Risk assessment result: approved={result.approved}, risk_score={result.risk_score:.3f}')
+              
+              return result
+          
+          @app.get('/portfolio-heat')
+          async def get_portfolio_heat():
+              '''Get current portfolio heat'''
+              heat = calculate_portfolio_heat()
+              return {
+                  'portfolio_heat': heat,
+                  'max_heat': 0.25,
+                  'status': 'high' if heat > 0.2 else 'normal',
+                  'timestamp': datetime.now().isoformat()
+              }
+          
+          @app.get('/volatility/{symbol}')
+          async def get_volatility(symbol: str):
+              '''Get volatility for a symbol'''
+              vol = calculate_volatility(symbol)
+              return {
+                  'symbol': symbol,
+                  'volatility': vol,
+                  'timestamp': datetime.now().isoformat()
+              }
+          
+          if __name__ == '__main__':
+              logger.info('Starting Risk Management Service')
+              uvicorn.run(app, host='0.0.0.0', port=8027)
+          "
+        envFrom:
+        - configMapRef:
+            name: crypto-trading-config
+        - secretRef:
+            name: mysql-credentials
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8027
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8027
+          initialDelaySeconds: 10
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: risk-management-service
+  namespace: crypto-trading
+spec:
+  selector:
+    app: risk-management-service
+  ports:
+  - protocol: TCP
+    port: 8027
+    targetPort: 8027
+
+

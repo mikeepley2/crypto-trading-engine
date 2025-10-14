@@ -1,0 +1,724 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trade-executor-real
+  namespace: crypto-trading
+  labels:
+    app: trade-executor-real
+    component: trade-execution
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trade-executor-real
+  template:
+    metadata:
+      labels:
+        app: trade-executor-real
+        component: trade-execution
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8024"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: trade-executor-real
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8024
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          # Install dependencies
+          pip install fastapi uvicorn requests cryptography pyjwt mysql-connector-python coinbase-advanced-py prometheus_client
+          
+          # Create the real trade executor service
+          python -c "
+          import os
+          import time
+          import json
+          import jwt
+          import secrets
+          import requests
+          import mysql.connector
+          from cryptography.hazmat.primitives import serialization
+          from fastapi import FastAPI, HTTPException, Response
+          import uvicorn
+          import logging
+          from prometheus_client import Counter, Histogram, Gauge, generate_latest
+          
+          # Configure logging
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+          logger = logging.getLogger(__name__)
+          
+          # Prometheus metrics
+          trade_executions = Counter('trade_executions_total', 'Total trade executions', ['status', 'symbol'])
+          trade_execution_time = Histogram('trade_execution_time_seconds', 'Trade execution latency')
+          coinbase_api_time = Histogram('coinbase_api_time_seconds', 'Coinbase API response time')
+          order_precision_errors = Counter('order_precision_errors_total', 'Order precision errors')
+          balance_check_failures = Counter('balance_check_failures_total', 'Balance check failures')
+          pending_recommendations = Gauge('pending_recommendations', 'Number of pending recommendations')
+          
+          app = FastAPI()
+          
+          def create_jwt_token(api_key, private_key, method, path):
+              try:
+                  private_key_obj = serialization.load_pem_private_key(private_key.encode('utf-8'), password=None)
+                  timestamp = str(int(time.time()))
+                  uri = f'{method.upper()} api.coinbase.com{path}'
+                  payload = {
+                      'iss': 'coinbase-cloud', 
+                      'nbf': int(timestamp), 
+                      'exp': int(timestamp) + 120, 
+                      'sub': api_key, 
+                      'uri': uri
+                  }
+                  headers = {'kid': api_key, 'nonce': secrets.token_hex(16)}
+                  return jwt.encode(payload, private_key_obj, algorithm='ES256', headers=headers)
+              except Exception as e:
+                  logger.error(f'Error creating JWT token: {e}')
+                  raise
+          
+          def get_db_connection():
+              return mysql.connector.connect(
+                  host=os.getenv('DB_HOST', '172.22.32.1'),
+                  user=os.getenv('DB_USER', 'news_collector'),
+                  password=os.getenv('DB_PASSWORD'),
+                  database='crypto_prices'
+              )
+          
+          def get_crypto_balance(symbol):
+              '''Get the available crypto balance for a symbol using official Coinbase SDK'''
+              try:
+                  from coinbase.rest import RESTClient
+                  
+                  api_key = os.getenv('COINBASE_API_KEY')
+                  private_key = os.getenv('COINBASE_PRIVATE_KEY')
+                  
+                  if not api_key or not private_key:
+                      logger.warning('Missing Coinbase API credentials for balance check')
+                      return 0.0
+                  
+                  # Use official Coinbase SDK
+                  client = RESTClient(api_key=api_key, api_secret=private_key)
+                  
+                  # Get account balances using official SDK
+                  accounts = client.get_accounts()
+                  
+                  if accounts and hasattr(accounts, 'accounts'):
+                      # Find the crypto account for this symbol
+                      for account in accounts.accounts:
+                          if account.currency == symbol and account.type == 'ACCOUNT_TYPE_CRYPTO':
+                              # Handle both dict and object formats
+                              if hasattr(account.available_balance, 'value'):
+                                  available_balance = float(account.available_balance.value)
+                              else:
+                                  available_balance = float(account.available_balance['value'])
+                              logger.info(f'{symbol} available balance: {available_balance}')
+                              return available_balance
+                      
+                      logger.info(f'No {symbol} holdings found in account')
+                      return 0.0
+                  else:
+                      logger.warning(f'Failed to get account balances from SDK')
+                      return 0.0
+                      
+              except ImportError:
+                  logger.warning('Coinbase SDK not available, falling back to manual check')
+                  # Fallback to manual JWT authentication
+                  try:
+                      api_key = os.getenv('COINBASE_API_KEY')
+                      private_key = os.getenv('COINBASE_PRIVATE_KEY')
+                      
+                      if not api_key or not private_key:
+                          logger.warning('Missing Coinbase API credentials for balance check')
+                          return 0.0
+                      
+                      # Create JWT token for accounts endpoint
+                      jwt_token = create_jwt_token(api_key, private_key, 'GET', '/api/v3/brokerage/accounts')
+                      
+                      headers = {
+                          'Authorization': f'Bearer {jwt_token}',
+                          'Content-Type': 'application/json'
+                      }
+                      
+                      # Get account balances
+                      response = requests.get(
+                          'https://api.coinbase.com/api/v3/brokerage/accounts',
+                          headers=headers,
+                          timeout=10
+                      )
+                      
+                      if response.status_code == 200:
+                          accounts = response.json().get('accounts', [])
+                          
+                          # Find the crypto account for this symbol
+                          for account in accounts:
+                              if account.get('currency') == symbol and account.get('type') == 'CRYPTO':
+                                  available_balance = float(account.get('available_balance', {}).get('value', 0))
+                                  logger.info(f'{symbol} available balance: {available_balance}')
+                                  return available_balance
+                          
+                          logger.info(f'No {symbol} holdings found in account')
+                          return 0.0
+                      else:
+                          logger.warning(f'Failed to get account balances: {response.status_code} - {response.text}')
+                          return 0.0
+                          
+                  except Exception as e:
+                      logger.warning(f'Error in manual balance check for {symbol}: {e}')
+                      return 0.0
+                      
+              except Exception as e:
+                  logger.warning(f'Error getting crypto balance for {symbol}: {e}')
+                  return 0.0
+
+          def get_crypto_account_uuid(symbol):
+              """Get account UUID for a specific crypto symbol"""
+              try:
+                  from coinbase.rest import RESTClient
+                  
+                  api_key = os.getenv('COINBASE_API_KEY')
+                  private_key = os.getenv('COINBASE_PRIVATE_KEY')
+                  
+                  if not api_key or not private_key:
+                      logger.warning('Missing Coinbase API credentials for account UUID check')
+                      return None
+                  
+                  # Use official Coinbase SDK
+                  client = RESTClient(api_key=api_key, api_secret=private_key)
+                  
+                  # Get account balances using official SDK
+                  accounts = client.get_accounts()
+                  
+                  if accounts and hasattr(accounts, 'accounts'):
+                      # Find the crypto account for this symbol
+                      for account in accounts.accounts:
+                          if account.currency == symbol and account.type == 'ACCOUNT_TYPE_CRYPTO':
+                              return getattr(account, 'uuid', None)
+                  
+                  return None
+              except Exception as e:
+                  logger.warning(f'Error getting {symbol} account UUID: {e}')
+                  return None
+
+          def check_crypto_holdings(symbol):
+              '''Check if we have sufficient crypto holdings to sell using official Coinbase SDK'''
+              balance = get_crypto_balance(symbol)
+              return balance > 0.001  # Need at least 0.001 to sell
+
+          def execute_real_trade(symbol, side, amount_usd):
+              '''Execute a real trade on Coinbase'''
+              try:
+                  api_key = os.getenv('COINBASE_API_KEY')
+                  private_key = os.getenv('COINBASE_PRIVATE_KEY')
+                  
+                  if not api_key or not private_key:
+                      raise Exception('Missing Coinbase API credentials')
+                  
+                  # Get order type from environment (default to market orders)
+                  order_type = os.getenv('ORDER_TYPE', 'market').lower()
+                  if order_type not in ['market', 'limit']:
+                      order_type = 'market'  # Default to market orders
+                  
+                  # Get current price for SELL orders
+                  current_price = None
+                  if side.upper() == 'SELL':
+                      try:
+                          conn = get_db_connection()
+                          cursor = conn.cursor()
+                          cursor.execute('SELECT current_price FROM ml_features_materialized WHERE symbol = %s ORDER BY timestamp_iso DESC LIMIT 1', (symbol,))
+                          price_result = cursor.fetchone()
+                          if price_result and price_result[0]:
+                              current_price = float(price_result[0])
+                              logger.info(f'Current price for {symbol}: ${current_price}')
+                          conn.close()
+                      except Exception as e:
+                          logger.warning(f'Could not get current price for {symbol}: {e}')
+                  
+                  # Create JWT token
+                  jwt_token = create_jwt_token(api_key, private_key, 'POST', '/api/v3/brokerage/orders')
+                  
+                  headers = {
+                      'Authorization': f'Bearer {jwt_token}',
+                      'Content-Type': 'application/json'
+                  }
+                  
+                  # Prepare order data - different parameters for BUY vs SELL
+                  crypto_amount = None  # Initialize for BUY orders
+                  
+                  if side.upper() == 'BUY':
+                      # BUY orders use quote_size (USD amount)
+                      # Get current price for BUY orders
+                      if not current_price or current_price <= 0:
+                          # Fallback: use a reasonable default based on symbol
+                          default_prices = {
+                              'BTC': 30000, 'ETH': 2000, 'SOL': 100, 'ADA': 0.5, 'XRP': 0.5,
+                              'DOT': 5, 'LINK': 10, 'UNI': 5, 'AAVE': 100, 'MATIC': 0.5,
+                              'AVAX': 20, 'LTC': 100, 'BCH': 200, 'ATOM': 10, 'ICP': 5,
+                              'FIL': 5, 'TRX': 0.1, 'ETC': 20, 'XLM': 0.1, 'VET': 0.02,
+                              'MKR': 2000, 'COMP': 50, 'EOS': 1, 'THETA': 1, 'XTZ': 1,
+                              'YFI': 5000, 'SHIB': 0.00001, 'CRV': 1, 'ALGO': 0.2, 'NEAR': 2,
+                              'OP': 1, 'ARB': 1, 'FLOKI': 0.00001, 'BONK': 0.00001, 'WIF': 0.1,
+                              'PEPE': 0.00001, 'SUSHI': 1, 'PENGU': 0.00001, 'BRETT': 0.00001,
+                              'FARTCOIN': 0.00001, 'AST': 0.1, 'BNB': 300, 'CVX': 10, 'DEXT': 0.1
+                          }
+                          current_price = default_prices.get(symbol, 100)  # Default to $100
+                          logger.warning(f'Using fallback price ${current_price} for {symbol} BUY order')
+                      
+                      if order_type == 'market':
+                          order_data = {
+                              'product_id': f'{symbol}-USD',
+                              'side': 'BUY',
+                              'client_order_id': f'BUY_{symbol}_{int(time.time() * 1000)}',
+                              'order_configuration': {
+                                  'market_market_ioc': {
+                                      'quote_size': str(amount_usd)
+                                  }
+                              }
+                          }
+                      else:  # limit order
+                          order_data = {
+                              'product_id': f'{symbol}-USD',
+                              'side': 'BUY',
+                              'client_order_id': f'BUY_{symbol}_{int(time.time() * 1000)}',
+                              'order_configuration': {
+                                  'limit_limit_gtc': {
+                                      'quote_size': str(amount_usd),
+                                      'limit_price': str(round(current_price * 1.01, 2))  # 1% above current price
+                                  }
+                              }
+                          }
+                  else:
+                      # SELL orders use base_size (crypto amount)
+                      # Calculate crypto amount first
+                      if current_price and current_price > 0:
+                          crypto_amount = amount_usd / current_price
+                      else:
+                          # Fallback: use a reasonable default based on symbol
+                          default_prices = {
+                              'BTC': 30000, 'ETH': 2000, 'SOL': 100, 'ADA': 0.5, 'XRP': 0.5,
+                              'DOT': 5, 'LINK': 10, 'UNI': 5, 'AAVE': 100, 'MATIC': 0.5,
+                              'AVAX': 20, 'LTC': 100, 'BCH': 200, 'ATOM': 10, 'ICP': 5,
+                              'FIL': 5, 'TRX': 0.1, 'ETC': 20, 'XLM': 0.1, 'VET': 0.02,
+                              'MKR': 2000, 'COMP': 50, 'EOS': 1, 'THETA': 1, 'XTZ': 1,
+                              'YFI': 5000, 'SHIB': 0.00001, 'CRV': 1, 'ALGO': 0.2, 'NEAR': 2,
+                              'OP': 1, 'ARB': 1, 'FLOKI': 0.00001, 'BONK': 0.00001, 'WIF': 0.1,
+                              'PEPE': 0.00001, 'SUSHI': 1, 'PENGU': 0.00001, 'BRETT': 0.00001,
+                              'FARTCOIN': 0.00001, 'AST': 0.1, 'BNB': 300, 'CVX': 10, 'DEXT': 0.1
+                          }
+                          fallback_price = default_prices.get(symbol, 100)  # Default to $100
+                          crypto_amount = amount_usd / fallback_price
+                          logger.warning(f'Using fallback price ${fallback_price} for {symbol}')
+                      
+                      # Round to appropriate precision based on asset type
+                      precision_map = {
+                          # High-value assets: 8 decimals
+                          'BTC': 8, 'ETH': 8, 'BNB': 8,
+                          # Mid-value assets: 4 decimals  
+                          'SOL': 4, 'UNI': 4, 'AAVE': 4, 'AVAX': 4, 'LTC': 4, 'BCH': 4, 'ICP': 4, 'FIL': 4, 'ETC': 4, 'MKR': 4, 'COMP': 4, 'YFI': 4, 'CRV': 4, 'NEAR': 4, 'OP': 4, 'ARB': 4, 'CVX': 4,
+                          # Lower-value assets: 2 decimals (fixed precision issues)
+                          'ADA': 2, 'XRP': 2, 'DOT': 2, 'MATIC': 2, 'TRX': 2, 'XLM': 2, 'VET': 2, 'EOS': 2, 'THETA': 2, 'XTZ': 2, 'SHIB': 2, 'ALGO': 2, 'FLOKI': 2, 'BONK': 2, 'WIF': 2, 'PEPE': 2, 'SUSHI': 2, 'PENGU': 2, 'BRETT': 2, 'FARTCOIN': 2, 'AST': 2, 'DEXT': 2, 'LINK': 2, 'ATOM': 2, 'DOGE': 2
+                      }
+                      precision = precision_map.get(symbol, 4)  # Default to 4 decimals
+                      crypto_amount = round(crypto_amount, precision)
+                      
+                      # Ensure precision rounding doesn't result in 0.0 when we have a valid amount
+                      if crypto_amount == 0.0 and available_balance > 0:
+                          # Use the minimum precision that preserves the amount
+                          crypto_amount = round(available_balance, precision)
+                          if crypto_amount == 0.0:
+                              # If still 0.0, use more precision
+                              crypto_amount = round(available_balance, precision + 1)
+                      
+                      # Final check: if crypto_amount is still 0.0, skip the order
+                      if crypto_amount <= 0:
+                          logger.warning(f'{symbol} calculated amount is 0 or negative after precision adjustment - skipping')
+                          return {
+                              'success': False,
+                              'error': f'Calculated amount is zero or negative after precision adjustment',
+                              'calculated_crypto_amount': crypto_amount
+                          }
+                      
+                      # Check minimum order sizes
+                      min_base_sizes = {
+                          'ATOM': 0.01, 'ADA': 0.00000001, 'LINK': 0.01, 'DOGE': 0.1,
+                          'BTC': 0.00001, 'ETH': 0.00001, 'SOL': 0.01, 'UNI': 0.01,
+                          'AAVE': 0.01, 'AVAX': 0.01, 'LTC': 0.001, 'BCH': 0.001,
+                          'ICP': 0.01, 'FIL': 0.01, 'ETC': 0.01, 'MKR': 0.001,
+                          'COMP': 0.01, 'YFI': 0.0001, 'CRV': 0.1, 'NEAR': 0.1,
+                          'OP': 0.1, 'ARB': 0.1, 'CVX': 0.01, 'XRP': 0.1,
+                          'DOT': 0.1, 'MATIC': 0.1, 'TRX': 1, 'XLM': 1,
+                          'VET': 1, 'EOS': 0.1, 'THETA': 0.1, 'XTZ': 0.1,
+                          'SHIB': 1000, 'ALGO': 0.1, 'FLOKI': 1000, 'BONK': 1000,
+                          'WIF': 1, 'PEPE': 1000, 'SUSHI': 0.1, 'PENGU': 1000,
+                          'BRETT': 1000, 'FARTCOIN': 1000, 'AST': 1, 'DEXT': 1
+                      }
+                      min_base_size = min_base_sizes.get(symbol, 0.01)
+                      
+                      if crypto_amount < min_base_size:
+                          logger.warning(f'{symbol} sell amount {crypto_amount} is below minimum {min_base_size} - skipping')
+                          return {
+                              'success': False,
+                              'error': f'Order amount below minimum size',
+                              'calculated_crypto_amount': crypto_amount
+                          }
+                      
+                      # Ensure we don't place orders with 0.0 amounts
+                      if crypto_amount <= 0:
+                          logger.warning(f'{symbol} sell amount is 0 or negative - skipping')
+                          return {
+                              'success': False,
+                              'error': f'Order amount is zero or negative',
+                              'calculated_crypto_amount': crypto_amount
+                          }
+                      
+                      # Check holdings and adjust amount if needed
+                      available_balance = get_crypto_balance(symbol)
+                      if available_balance <= 0.001:  # Need at least 0.001 to sell
+                          logger.warning(f'Insufficient {symbol} holdings for SELL order - skipping')
+                          return {
+                              'success': False,
+                              'error': f'Insufficient {symbol} holdings for SELL order',
+                              'error_type': 'INSUFFICIENT_HOLDINGS',
+                              'calculated_crypto_amount': None
+                          }
+                      
+                      # Adjust amount to not exceed available holdings
+                      if available_balance < crypto_amount:
+                          logger.info(f'Adjusting {symbol} sell amount from {crypto_amount} to {available_balance} (available balance)')
+                          crypto_amount = available_balance
+                          # Re-round after adjustment
+                          crypto_amount = round(crypto_amount, precision)
+                      
+                      # Get account UUID for the crypto asset
+                      account_uuid = get_crypto_account_uuid(symbol)
+                      
+                      if order_type == 'market':
+                          order_data = {
+                              'product_id': f'{symbol}-USD',
+                              'side': 'SELL',
+                              'client_order_id': f'SELL_{symbol}_{int(time.time() * 1000)}',
+                              'order_configuration': {
+                                  'market_market_ioc': {
+                                      'base_size': str(crypto_amount)
+                                  }
+                              }
+                          }
+                      else:  # limit order
+                          order_data = {
+                              'product_id': f'{symbol}-USD',
+                              'side': 'SELL',
+                              'client_order_id': f'SELL_{symbol}_{int(time.time() * 1000)}',
+                              'order_configuration': {
+                                  'limit_limit_gtc': {
+                                      'base_size': str(crypto_amount),
+                                      'limit_price': str(round(current_price * 0.99, 2))  # 1% below current price
+                                  }
+                              }
+                          }
+                      
+                      # Add account UUID if available
+                      if account_uuid:
+                          order_data['account_uuid'] = account_uuid
+                  
+                  logger.info(f'Executing real trade: {symbol} {side} ${amount_usd}')
+                  logger.info(f'Order data: {json.dumps(order_data, indent=2)}')
+                  
+                  # Make the actual API call to Coinbase
+                  response = requests.post(
+                      'https://api.coinbase.com/api/v3/brokerage/orders',
+                      headers=headers,
+                      json=order_data,
+                      timeout=30
+                  )
+                  
+                  logger.info(f'Coinbase API response status: {response.status_code}')
+                  logger.info(f'Coinbase API response: {response.text}')
+                  
+                  if response.status_code == 200:
+                      result = response.json()
+                      
+                      # Check if the trade was actually successful
+                      if result.get('success', False):
+                          logger.info(f'✅ Real trade executed successfully: {result}')
+                          return {
+                              'success': True,
+                              'order_id': result.get('order_id'),
+                              'status': result.get('status'),
+                              'response': result,
+                              'calculated_crypto_amount': crypto_amount
+                          }
+                      else:
+                          # Trade failed - API returned success: false
+                          error_msg = result.get('error_response', {}).get('message', 'Unknown error')
+                          logger.error(f'❌ Trade execution failed: {error_msg}')
+                          logger.error(f'❌ Full response: {result}')
+                          return {
+                              'success': False,
+                              'error': error_msg,
+                              'response': result,
+                              'calculated_crypto_amount': crypto_amount
+                          }
+                  else:
+                      logger.error(f'❌ Trade execution failed: {response.status_code} - {response.text}')
+                      return {
+                          'success': False,
+                          'error': f'API error {response.status_code}: {response.text}',
+                          'status_code': response.status_code,
+                          'calculated_crypto_amount': crypto_amount
+                      }
+                      
+              except Exception as e:
+                  logger.error(f'Error executing real trade: {e}')
+                  return {
+                      'success': False,
+                      'error': str(e),
+                      'calculated_crypto_amount': None
+                  }
+          
+          @app.get('/health')
+          async def health():
+              try:
+                  api_key = os.getenv('COINBASE_API_KEY')
+                  private_key = os.getenv('COINBASE_PRIVATE_KEY')
+                  
+                  if not api_key or not private_key:
+                      return {'status': 'unhealthy', 'error': 'Missing API credentials'}
+                  
+                  jwt_token = create_jwt_token(api_key, private_key, 'GET', '/api/v3/brokerage/accounts')
+                  headers = {'Authorization': f'Bearer {jwt_token}', 'Content-Type': 'application/json'}
+                  
+                  response = requests.get('https://api.coinbase.com/api/v3/brokerage/accounts', headers=headers, timeout=10)
+                  
+                  return {
+                      'status': 'healthy', 
+                      'api_connected': response.status_code == 200, 
+                      'response_code': response.status_code,
+                      'execution_mode': 'REAL_TRADES'
+                  }
+              except Exception as e:
+                  return {'status': 'unhealthy', 'error': str(e)}
+          
+          @app.get('/test')
+          async def test():
+              return {'message': 'Real trade executor is running with JWT authentication'}
+          
+          @app.get('/metrics')
+          async def metrics():
+              return Response(content=generate_latest(), media_type='text/plain')
+          
+          def check_risk_management(symbol: str, side: str, amount: float, confidence: float, current_price: float) -> dict:
+              '''Check with risk management service before executing trade'''
+              try:
+                  risk_service_url = os.getenv('RISK_MANAGEMENT_SERVICE_URL', 'http://risk-management-service:8027')
+                  
+                  risk_assessment = {
+                      'symbol': symbol,
+                      'side': side,
+                      'amount': amount,
+                      'confidence': confidence,
+                      'current_price': current_price
+                  }
+                  
+                  logger.info(f'Checking risk management for {symbol} {side} ${amount}')
+                  
+                  response = requests.post(
+                      f'{risk_service_url}/assess-risk',
+                      json=risk_assessment,
+                      timeout=10
+                  )
+                  
+                  if response.status_code == 200:
+                      result = response.json()
+                      logger.info(f'Risk assessment: approved={result[\"approved\"]}, risk_score={result[\"risk_score\"]:.3f}')
+                      return result
+                  else:
+                      logger.warning(f'Risk management service unavailable: {response.status_code}')
+                      return {'approved': True, 'recommended_amount': amount}  # Fallback to allow trade
+                      
+              except Exception as e:
+                  logger.warning(f'Risk management check failed: {e}')
+                  return {'approved': True, 'recommended_amount': amount}  # Fallback to allow trade
+
+          @app.post('/process_recommendation/{recommendation_id}')
+          async def process_recommendation(recommendation_id: int):
+              try:
+                  logger.info(f'Processing recommendation {recommendation_id} with REAL trade execution')
+                  
+                  # Get recommendation from database
+                  conn = get_db_connection()
+                  cursor = conn.cursor(dictionary=True)
+                  cursor.execute('SELECT * FROM trade_recommendations WHERE id = %s', (recommendation_id,))
+                  rec = cursor.fetchone()
+                  
+                  if not rec:
+                      raise HTTPException(status_code=404, detail='Recommendation not found')
+                  
+                  symbol = rec['symbol']
+                  signal_type = rec['signal_type']
+                  amount_usd = float(rec['amount_usd'])
+                  confidence = float(rec['confidence'])
+                  
+                  # Get current price for risk assessment
+                  cursor.execute('SELECT current_price FROM ml_features_materialized WHERE symbol = %s ORDER BY timestamp_iso DESC LIMIT 1', (symbol,))
+                  price_result = cursor.fetchone()
+                  current_price = float(price_result['current_price']) if price_result else 0.0
+                  
+                  # Check with risk management service
+                  risk_result = check_risk_management(symbol, signal_type, amount_usd, confidence, current_price)
+                  
+                  if not risk_result.get('approved', True):
+                      logger.warning(f'Risk management rejected trade: {risk_result.get(\"risk_factors\", [])}')
+                      # Update status to CANCELLED due to risk
+                      cursor.execute('''
+                          UPDATE trade_recommendations 
+                          SET execution_status = %s, 
+                              executed_at = NOW(),
+                              amount_crypto = NULL
+                          WHERE id = %s
+                      ''', ('CANCELLED', recommendation_id))
+                      conn.commit()
+                      
+                      return {
+                          'status': 'cancelled',
+                          'message': f'Trade cancelled by risk management: {risk_result.get(\"risk_factors\", [])}',
+                          'risk_result': risk_result
+                      }
+                  
+                  # Use risk-adjusted amount if provided
+                  adjusted_amount = risk_result.get('recommended_amount', amount_usd)
+                  if adjusted_amount != amount_usd:
+                      logger.info(f'Risk management adjusted amount from ${amount_usd} to ${adjusted_amount}')
+                  
+                  logger.info(f'Executing REAL trade: {symbol} {signal_type} ${adjusted_amount}')
+                  
+                  # Execute the real trade on Coinbase
+                  trade_result = execute_real_trade(symbol, signal_type, adjusted_amount)
+                  
+                  if trade_result['success']:
+                      # Update status to EXECUTED with real trade details
+                      calculated_crypto_amount = trade_result.get('calculated_crypto_amount')
+                      cursor.execute('''
+                          UPDATE trade_recommendations 
+                          SET execution_status = %s, 
+                              executed_at = NOW(),
+                              entry_price = %s,
+                              amount_crypto = %s
+                          WHERE id = %s
+                      ''', (
+                          'EXECUTED',
+                          trade_result.get('response', {}).get('average_filled_price', 0),
+                          calculated_crypto_amount,
+                          recommendation_id
+                      ))
+                      conn.commit()
+                      
+                      logger.info(f'✅ Real trade executed and database updated for recommendation {recommendation_id}')
+                      
+                      return {
+                          'status': 'success',
+                          'message': f'Real trade executed successfully for recommendation {recommendation_id}',
+                          'trade_result': trade_result,
+                          'recommendation': {
+                              'id': rec['id'],
+                              'symbol': rec['symbol'],
+                              'signal_type': rec['signal_type'],
+                              'amount_usd': float(rec['amount_usd']),
+                              'confidence': float(rec['confidence'])
+                          }
+                      }
+                  else:
+                      # Handle different error types
+                      error_type = trade_result.get('error_type', 'UNKNOWN')
+                      error_message = trade_result.get('error', 'Unknown error')
+                      
+                      if error_type == 'INSUFFICIENT_HOLDINGS':
+                          # Mark as CANCELLED for insufficient holdings (not a failure)
+                          calculated_crypto_amount = trade_result.get('calculated_crypto_amount')
+                          cursor.execute('''
+                              UPDATE trade_recommendations 
+                              SET execution_status = %s, 
+                                  executed_at = NOW(),
+                                  error_message = %s,
+                                  amount_crypto = %s
+                              WHERE id = %s
+                          ''', ('CANCELLED', error_message, calculated_crypto_amount, recommendation_id))
+                          conn.commit()
+                          
+                          logger.warning(f'⚠️ Trade cancelled for recommendation {recommendation_id}: {error_message}')
+                          
+                          return {
+                              'status': 'cancelled',
+                              'message': f'Trade cancelled: {error_message}',
+                              'trade_result': trade_result
+                          }
+                      else:
+                          # Update status to FAILED for other errors
+                          calculated_crypto_amount = trade_result.get('calculated_crypto_amount')
+                          cursor.execute('''
+                              UPDATE trade_recommendations 
+                              SET execution_status = %s, 
+                                  executed_at = NOW(),
+                                  error_message = %s,
+                                  amount_crypto = %s
+                              WHERE id = %s
+                          ''', ('FAILED', error_message, calculated_crypto_amount, recommendation_id))
+                          conn.commit()
+                          
+                          logger.error(f'❌ Real trade failed for recommendation {recommendation_id}: {trade_result}')
+                          
+                          return {
+                              'status': 'error',
+                              'message': f'Real trade execution failed: {error_message}',
+                              'trade_result': trade_result
+                          }
+                  
+              except Exception as e:
+                  logger.error(f'Error processing recommendation {recommendation_id}: {e}')
+                  return {'status': 'error', 'message': str(e)}
+              finally:
+                  if 'conn' in locals():
+                      conn.close()
+          
+          if __name__ == '__main__':
+              logger.info('Starting REAL trade executor with actual Coinbase API calls')
+              uvicorn.run(app, host='0.0.0.0', port=8024)
+          "
+        envFrom:
+        - configMapRef:
+            name: trade-exec-coinbase-config
+        - secretRef:
+            name: trade-exec-coinbase-secrets
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8024
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8024
+          initialDelaySeconds: 10
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trade-executor-real
+  namespace: crypto-trading
+spec:
+  selector:
+    app: trade-executor-real
+  ports:
+  - protocol: TCP
+    port: 8024
+    targetPort: 8024

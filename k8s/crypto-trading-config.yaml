@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crypto-trading-config
+  namespace: crypto-trading
+  labels:
+    app: crypto-trading-system
+    component: config
+data:
+  # Database Configuration
+  DB_HOST: "172.22.32.1"
+  DB_USER: "news_collector"
+  DB_NAME_PRICES: "crypto_prices"
+  DB_NAME_TRANSACTIONS: "crypto_transactions"
+  
+  # Service URLs
+  SIGNAL_BRIDGE_URL: "http://signal-bridge:8022"
+  TRADE_EXECUTOR_URL: "http://trade-executor:8024"
+  TRADE_ORCHESTRATOR_URL: "http://trade-orchestrator-llm:8023"
+  LLM_VALIDATION_URL: "http://llm-validation-service:8050"
+  MARKET_SELLOFF_DETECTOR_URL: "http://market-selloff-detector:8027"
+  
+  # Trading Configuration
+  CHECK_INTERVAL: "30"
+  MAX_AGE_HOURS: "2.0"
+  MAX_TRADES_PER_CYCLE: "3"
+  
+  # Market Monitoring Configuration
+  CORRELATION_THRESHOLD: "0.85"
+  DECLINE_THRESHOLD: "0.70"
+  DECLINE_MAGNITUDE: "0.10"
+  VOLATILITY_MULTIPLIER: "3.0"
+  VOLUME_MULTIPLIER: "5.0"
+  
+  # Logging
+  LOG_LEVEL: "INFO"
+

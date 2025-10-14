@@ -19,6 +19,9 @@ data:
   COINBASE_API_MODE: "live"
   TRADE_EXECUTION_ENABLED: "true"
   
+  # Order Type Configuration (market or limit)
+  ORDER_TYPE: "market"
+  
   # Risk Management Settings
   MAX_POSITION_SIZE_USD: "500.0"
   MAX_DAILY_TRADES: "300"

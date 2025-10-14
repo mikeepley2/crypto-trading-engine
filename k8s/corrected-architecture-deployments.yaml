@@ -1,0 +1,820 @@
+# =============================================================================
+# CORRECTED CRYPTO TRADING ENGINE ARCHITECTURE
+# =============================================================================
+# This file contains all services with proper node selectors based on logical
+# service grouping and workload requirements.
+# =============================================================================
+
+---
+# =============================================================================
+# DATA COLLECTION NODE SERVICES
+# =============================================================================
+# Node: cryptoai-k8s-trading-engine-worker (cryptoai-data-collection)
+# Purpose: Data collection, basic monitoring, system health
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: health-monitor
+  namespace: crypto-trading
+  labels:
+    app: health-monitor
+    component: monitoring
+    node-type: data-collection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: health-monitor
+  template:
+    metadata:
+      labels:
+        app: health-monitor
+        component: monitoring
+        node-type: data-collection
+    spec:
+      nodeSelector:
+        node-name: cryptoai-data-collection
+      containers:
+      - name: health-monitor
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8080
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn requests
+          python -c "
+          from fastapi import FastAPI
+          import uvicorn
+          import requests
+          import time
+          import threading
+          
+          app = FastAPI(title='Health Monitor')
+          
+          @app.get('/health')
+          async def health():
+              return {'status': 'healthy', 'service': 'health-monitor'}
+          
+          def monitor_services():
+              while True:
+                  try:
+                      # Monitor other services
+                      time.sleep(30)
+                  except Exception as e:
+                      print(f'Monitoring error: {e}')
+                      time.sleep(60)
+          
+          threading.Thread(target=monitor_services, daemon=True).start()
+          uvicorn.run(app, host='0.0.0.0', port=8080)
+          "
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+
+---
+# =============================================================================
+# TRADING ENGINE NODE SERVICES
+# =============================================================================
+# Node: cryptoai-k8s-trading-engine-worker2 (cryptoai-trading-engine)
+# Purpose: Core trading logic, ML signals, trade execution, risk management
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-generator-working
+  namespace: crypto-trading
+  labels:
+    app: signal-generator-working
+    component: signal-generation
+    node-type: trading-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signal-generator-working
+  template:
+    metadata:
+      labels:
+        app: signal-generator-working
+        component: signal-generation
+        node-type: trading-engine
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8025"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        node-name: cryptoai-trading-engine
+      containers:
+      - name: signal-generator-working
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8025
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn mysql-connector-python requests numpy pandas scikit-learn xgboost joblib prometheus_client
+          mkdir -p /app/models
+          python -c "
+          import os
+          import sys
+          import logging
+          import joblib
+          import pandas as pd
+          import numpy as np
+          import mysql.connector
+          import time
+          from datetime import datetime, timedelta
+          from fastapi import FastAPI, Response
+          import uvicorn
+          import threading
+          from decimal import Decimal
+          from prometheus_client import Counter, Histogram, Gauge, generate_latest
+          
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+          logger = logging.getLogger(__name__)
+          
+          # Prometheus metrics
+          signals_generated = Counter('signals_generated_total', 'Total signals generated', ['symbol', 'signal_type'])
+          signal_confidence = Histogram('signal_confidence', 'Signal confidence scores', buckets=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+          model_inference_time = Histogram('model_inference_time_seconds', 'ML model inference time')
+          database_query_time = Histogram('database_query_time_seconds', 'Database query latency')
+          model_load_status = Gauge('model_load_status', 'ML model load status (1=loaded, 0=not loaded)')
+          signals_generated_today = Gauge('signals_generated_today', 'Signals generated today')
+          
+          model = None
+          app = FastAPI(title='Signal Generator - ML Only (No Fallbacks)')
+          
+          def get_db_connection():
+              try:
+                  return mysql.connector.connect(
+                      host=os.getenv('DB_HOST', 'host.docker.internal'),
+                      user=os.getenv('DB_USER', 'news_collector'),
+                      password=os.getenv('DB_PASSWORD', '99Rules!'),
+                      database=os.getenv('DB_NAME_PRICES', 'crypto_prices')
+                  )
+              except Exception as e:
+                  logger.error(f'Database connection error: {e}')
+                  return None
+          
+          def load_model():
+              global model
+              try:
+                  model_path = '/app/models/balanced_realistic_model_20251005_155755.joblib'
+                  if not os.path.exists(model_path):
+                      logger.critical(f'CRITICAL: ML model file not found at {model_path}')
+                      raise FileNotFoundError(f'ML model file not found: {model_path}')
+                  
+                  model = joblib.load(model_path)
+                  logger.info(f'✅ ML model loaded successfully from {model_path}')
+                  return True
+              except Exception as e:
+                  logger.critical(f'CRITICAL: Failed to load ML model: {e}')
+                  raise e
+          
+          @app.get('/health')
+          async def health_check():
+              try:
+                  if model is None:
+                      model_load_status.set(0)
+                      return {'status': 'unhealthy', 'error': 'ML model not loaded'}
+                  model_load_status.set(1)
+                  return {'status': 'healthy', 'service': 'signal-generator-ml-only', 'model_loaded': True}
+              except Exception as e:
+                  model_load_status.set(0)
+                  return {'status': 'unhealthy', 'error': str(e)}
+          
+          @app.get('/metrics')
+          async def metrics():
+              return Response(content=generate_latest(), media_type='text/plain')
+          
+          if __name__ == '__main__':
+              logger.info('🚀 Starting Signal Generator - ML Only (No Fallbacks)')
+              try:
+                  load_model()
+                  logger.info('✅ ML model loaded successfully - service ready')
+              except Exception as e:
+                  logger.critical(f'CRITICAL: Cannot start service without ML model: {e}')
+                  sys.exit(1)
+              uvicorn.run(app, host='0.0.0.0', port=8025)
+          "
+        envFrom:
+        - configMapRef:
+            name: crypto-trading-config
+        - secretRef:
+            name: mysql-credentials
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models
+      volumes:
+      - name: model-storage
+        hostPath:
+          path: /tmp/crypto-trading-engine
+          type: DirectoryOrCreate
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trade-executor-real
+  namespace: crypto-trading
+  labels:
+    app: trade-executor-real
+    component: trade-execution
+    node-type: trading-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trade-executor-real
+  template:
+    metadata:
+      labels:
+        app: trade-executor-real
+        component: trade-execution
+        node-type: trading-engine
+    spec:
+      nodeSelector:
+        node-name: cryptoai-trading-engine
+      containers:
+      - name: trade-executor-real
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8024
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn requests mysql-connector-python coinbase-advanced-py
+          python /app/trade_executor_service.py
+        envFrom:
+        - configMapRef:
+            name: trade-exec-coinbase-config
+        - secretRef:
+            name: trade-exec-coinbase-secrets-fixed
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+      volumes:
+      - name: app-code
+        configMap:
+          name: trade-executor-code
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risk-management-service
+  namespace: crypto-trading
+  labels:
+    app: risk-management-service
+    component: risk-management
+    node-type: trading-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: risk-management-service
+  template:
+    metadata:
+      labels:
+        app: risk-management-service
+        component: risk-management
+        node-type: trading-engine
+    spec:
+      nodeSelector:
+        node-name: cryptoai-trading-engine
+      containers:
+      - name: risk-management-service
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8027
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn requests mysql-connector-python pandas numpy scikit-learn
+          python /app/risk_management_service.py
+        envFrom:
+        - configMapRef:
+            name: trade-exec-coinbase-config
+        - secretRef:
+            name: trade-exec-coinbase-secrets-fixed
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+      volumes:
+      - name: app-code
+        configMap:
+          name: risk-management-code
+
+---
+# =============================================================================
+# ANALYTICS & MONITORING NODE SERVICES
+# =============================================================================
+# Node: cryptoai-k8s-trading-engine-worker3 (cryptoai-analytics-monitoring)
+# Purpose: LLM services, monitoring, orchestration, analytics
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-server
+  namespace: crypto-trading
+  labels:
+    app: ollama-server
+    component: llm-server
+    node-type: analytics-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama-server
+  template:
+    metadata:
+      labels:
+        app: ollama-server
+        component: llm-server
+        node-type: analytics-monitoring
+    spec:
+      nodeSelector:
+        node-name: cryptoai-analytics-monitoring
+      containers:
+      - name: ollama-server
+        image: ollama/ollama:latest
+        ports:
+        - containerPort: 11434
+          name: http
+        env:
+        - name: OLLAMA_HOST
+          value: "0.0.0.0"
+        - name: OLLAMA_ORIGINS
+          value: "*"
+        resources:
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+        volumeMounts:
+        - name: ollama-data
+          mountPath: /root/.ollama
+        livenessProbe:
+          httpGet:
+            path: /api/tags
+            port: 11434
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/tags
+            port: 11434
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: ollama-data
+        emptyDir: {}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-llm-validation
+  namespace: crypto-trading
+  labels:
+    app: ollama-llm-validation
+    component: llm-validation
+    node-type: analytics-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama-llm-validation
+  template:
+    metadata:
+      labels:
+        app: ollama-llm-validation
+        component: llm-validation
+        node-type: analytics-monitoring
+    spec:
+      nodeSelector:
+        node-name: cryptoai-analytics-monitoring
+      containers:
+      - name: ollama-llm-validation
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8050
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn requests mysql-connector-python
+          python /app/llm_validation_service.py
+        envFrom:
+        - configMapRef:
+            name: ollama-config
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+      volumes:
+      - name: app-code
+        configMap:
+          name: ollama-llm-validation-code
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trade-orchestrator-llm
+  namespace: crypto-trading
+  labels:
+    app: trade-orchestrator-llm
+    component: orchestration
+    node-type: analytics-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trade-orchestrator-llm
+  template:
+    metadata:
+      labels:
+        app: trade-orchestrator-llm
+        component: orchestration
+        node-type: analytics-monitoring
+    spec:
+      nodeSelector:
+        node-name: cryptoai-analytics-monitoring
+      containers:
+      - name: trade-orchestrator-llm
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8023
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn requests mysql-connector-python
+          python /app/trade_orchestrator_llm.py
+        envFrom:
+        - configMapRef:
+            name: trade-exec-coinbase-config
+        - secretRef:
+            name: trade-exec-coinbase-secrets-fixed
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+      volumes:
+      - name: app-code
+        configMap:
+          name: trade-orchestrator-llm-code
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: crypto-trading
+  labels:
+    app: grafana
+    component: monitoring
+    node-type: analytics-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+        component: monitoring
+        node-type: analytics-monitoring
+    spec:
+      nodeSelector:
+        node-name: cryptoai-analytics-monitoring
+      containers:
+      - name: grafana
+        image: grafana/grafana:latest
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: GF_SECURITY_ADMIN_USER
+          value: admin
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: admin123
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        volumeMounts:
+        - name: grafana-storage
+          mountPath: /var/lib/grafana
+      volumes:
+      - name: grafana-storage
+        emptyDir: {}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simple-node-viewer
+  namespace: crypto-trading
+  labels:
+    app: simple-node-viewer
+    component: monitoring
+    node-type: analytics-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: simple-node-viewer
+  template:
+    metadata:
+      labels:
+        app: simple-node-viewer
+        component: monitoring
+        node-type: analytics-monitoring
+    spec:
+      nodeSelector:
+        node-name: cryptoai-analytics-monitoring
+      containers:
+      - name: simple-node-viewer
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8080
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install flask requests
+          python -c "
+          from flask import Flask, render_template_string
+          import requests
+          import json
+          import os
+
+          app = Flask(__name__)
+
+          HTML_TEMPLATE = '''
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>CryptoAI Trading Engine - Node Overview</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+                  .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                  h1 { color: #333; text-align: center; }
+                  .node-card { background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 15px; margin: 10px 0; }
+                  .node-name { font-weight: bold; color: #007bff; font-size: 18px; }
+                  .label { background: #e9ecef; padding: 4px 8px; border-radius: 4px; margin: 2px; display: inline-block; font-size: 12px; }
+                  .purpose { background: #d4edda; color: #155724; }
+                  .solution-area { background: #cce5ff; color: #004085; }
+                  .workload-type { background: #fff3cd; color: #856404; }
+                  .refresh-btn { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 10px 0; }
+                  .refresh-btn:hover { background: #0056b3; }
+              </style>
+          </head>
+          <body>
+              <div class=\"container\">
+                  <h1>🚀 CryptoAI Trading Engine - Corrected Architecture</h1>
+                  <button class=\"refresh-btn\" onclick=\"location.reload()\">🔄 Refresh</button>
+                  <div id=\"nodes\">
+                      {% for node in nodes %}
+                      <div class=\"node-card\">
+                          <div class=\"node-name\">{{ node.name }}</div>
+                          <div>
+                              <span class=\"label purpose\">Purpose: {{ node.purpose or 'N/A' }}</span>
+                              <span class=\"label solution-area\">Solution Area: {{ node.solution_area or 'N/A' }}</span>
+                              <span class=\"label workload-type\">Workload: {{ node.workload_type or 'N/A' }}</span>
+                          </div>
+                          <div style=\"margin-top: 10px;\">
+                              <strong>Services:</strong><br>
+                              {% for service in node.services %}
+                              <span class=\"label\">{{ service }}</span>
+                              {% endfor %}
+                          </div>
+                      </div>
+                      {% endfor %}
+                  </div>
+              </div>
+          </body>
+          </html>
+          '''
+
+          @app.route('/')
+          def index():
+              nodes = [
+                  {
+                      'name': 'cryptoai-k8s-trading-engine-control-plane',
+                      'purpose': 'cryptoai-control-plane',
+                      'solution_area': 'control-plane',
+                      'workload_type': 'control-plane',
+                      'services': ['Kubernetes Control Plane']
+                  },
+                  {
+                      'name': 'cryptoai-k8s-trading-engine-worker',
+                      'purpose': 'cryptoai-data-collection',
+                      'solution_area': 'data-collection',
+                      'workload_type': 'data-intensive',
+                      'services': ['Health Monitor']
+                  },
+                  {
+                      'name': 'cryptoai-k8s-trading-engine-worker2',
+                      'purpose': 'cryptoai-trading-engine',
+                      'solution_area': 'trading-engine',
+                      'workload_type': 'ml-trading',
+                      'services': ['Signal Generator', 'Trade Executor', 'Risk Management']
+                  },
+                  {
+                      'name': 'cryptoai-k8s-trading-engine-worker3',
+                      'purpose': 'cryptoai-analytics-monitoring',
+                      'solution_area': 'analytics-monitoring',
+                      'workload_type': 'monitoring',
+                      'services': ['Ollama Server', 'LLM Validation', 'Trade Orchestrator', 'Grafana', 'Node Viewer']
+                  }
+              ]
+              
+              return render_template_string(HTML_TEMPLATE, nodes=nodes)
+
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=8080, debug=False)
+          "
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+
+---
+# =============================================================================
+# SERVICES
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: health-monitor
+  namespace: crypto-trading
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    app: health-monitor
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signal-generator-working
+  namespace: crypto-trading
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8025
+    targetPort: 8025
+  selector:
+    app: signal-generator-working
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trade-executor-real
+  namespace: crypto-trading
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8024
+    targetPort: 8024
+  selector:
+    app: trade-executor-real
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: risk-management-service
+  namespace: crypto-trading
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8027
+    targetPort: 8027
+  selector:
+    app: risk-management-service
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: crypto-trading
+spec:
+  type: ClusterIP
+  ports:
+  - port: 11434
+    targetPort: 11434
+  selector:
+    app: ollama-server
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-llm-validation
+  namespace: crypto-trading
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8050
+    targetPort: 8050
+  selector:
+    app: ollama-llm-validation
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trade-orchestrator-llm
+  namespace: crypto-trading
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8023
+    targetPort: 8023
+  selector:
+    app: trade-orchestrator-llm
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: crypto-trading
+spec:
+  type: ClusterIP
+  ports:
+  - port: 3000
+    targetPort: 3000
+  selector:
+    app: grafana
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: simple-node-viewer
+  namespace: crypto-trading
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    app: simple-node-viewer
+
