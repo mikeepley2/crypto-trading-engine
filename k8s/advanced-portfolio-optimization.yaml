@@ -1,0 +1,752 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portfolio-optimization-code
+  namespace: crypto-trading
+  labels:
+    app: portfolio-optimization-service
+    component: portfolio-optimization
+data:
+  portfolio_optimization_service.py: |
+    import os
+    import time
+    import json
+    import mysql.connector
+    import requests
+    import pandas as pd
+    import numpy as np
+    from datetime import datetime, timedelta
+    from fastapi import FastAPI, HTTPException
+    import uvicorn
+    import logging
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest
+    from typing import Dict, List, Optional, Tuple
+    from dataclasses import dataclass
+    from scipy.optimize import minimize
+    from sklearn.covariance import LedoitWolf
+    import warnings
+    warnings.filterwarnings('ignore')
+    
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
+    # Prometheus metrics
+    portfolio_optimizations = Counter('portfolio_optimizations_total', 'Total portfolio optimizations performed', ['method'])
+    optimization_time = Histogram('portfolio_optimization_time_seconds', 'Portfolio optimization processing time')
+    portfolio_sharpe_ratio = Gauge('portfolio_sharpe_ratio', 'Current portfolio Sharpe ratio')
+    portfolio_volatility = Gauge('portfolio_volatility', 'Current portfolio volatility')
+    portfolio_expected_return = Gauge('portfolio_expected_return', 'Current portfolio expected return')
+    rebalancing_events = Counter('portfolio_rebalancing_events_total', 'Total portfolio rebalancing events', ['trigger'])
+    
+    app = FastAPI(title='Advanced Portfolio Optimization Service')
+    
+    @dataclass
+    class PortfolioWeights:
+        symbol: str
+        weight: float
+        expected_return: float
+        volatility: float
+        sharpe_ratio: float
+    
+    @dataclass
+    class OptimizationResult:
+        weights: Dict[str, float]
+        expected_return: float
+        volatility: float
+        sharpe_ratio: float
+        method: str
+        optimization_time: float
+    
+    def get_db_connection():
+        try:
+            return mysql.connector.connect(
+                host=os.getenv('DB_HOST'),
+                user=os.getenv('DB_USER'),
+                password=os.getenv('DB_PASSWORD'),
+                database=os.getenv('DB_NAME_PRICES')
+            )
+        except Exception as e:
+            logger.error(f'Database connection error: {e}')
+            return None
+    
+    def get_coinbase_client():
+        try:
+            from coinbase_advanced_py import RESTClient
+            return RESTClient(
+                api_key=os.getenv('COINBASE_API_KEY'),
+                api_secret=os.getenv('COINBASE_PRIVATE_KEY')
+            )
+        except Exception as e:
+            logger.error(f'Coinbase client error: {e}')
+            return None
+    
+    def get_historical_returns(symbols: List[str], days: int = 30) -> pd.DataFrame:
+        """Get historical returns for portfolio optimization"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return pd.DataFrame()
+            
+            cursor = conn.cursor()
+            
+            # Get historical prices for all symbols
+            returns_data = {}
+            for symbol in symbols:
+                cursor.execute('''
+                    SELECT timestamp, price
+                    FROM crypto_prices 
+                    WHERE symbol = %s 
+                    AND timestamp >= DATE_SUB(NOW(), INTERVAL %s DAY)
+                    ORDER BY timestamp ASC
+                ''', (symbol, days))
+                
+                data = cursor.fetchall()
+                if data:
+                    df = pd.DataFrame(data, columns=['timestamp', 'price'])
+                    df['price'] = pd.to_numeric(df['price'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df = df.set_index('timestamp')
+                    
+                    # Calculate daily returns
+                    returns = df['price'].pct_change().dropna()
+                    returns_data[symbol] = returns
+            
+            cursor.close()
+            conn.close()
+            
+            if not returns_data:
+                return pd.DataFrame()
+            
+            # Combine all returns into a single DataFrame
+            returns_df = pd.DataFrame(returns_data)
+            returns_df = returns_df.dropna()
+            
+            return returns_df
+            
+        except Exception as e:
+            logger.error(f'Error getting historical returns: {e}')
+            return pd.DataFrame()
+    
+    def calculate_portfolio_metrics(weights: Dict[str, float], returns_df: pd.DataFrame) -> Tuple[float, float, float]:
+        """Calculate portfolio expected return, volatility, and Sharpe ratio"""
+        try:
+            if returns_df.empty:
+                return 0.0, 0.0, 0.0
+            
+            # Calculate expected returns and covariance matrix
+            expected_returns = returns_df.mean() * 252  # Annualized
+            cov_matrix = returns_df.cov() * 252  # Annualized
+            
+            # Ensure weights are normalized
+            total_weight = sum(weights.values())
+            if total_weight > 0:
+                weights = {k: v/total_weight for k, v in weights.items()}
+            
+            # Create weight vector in the same order as returns_df columns
+            weight_vector = np.array([weights.get(symbol, 0.0) for symbol in returns_df.columns])
+            
+            # Calculate portfolio metrics
+            portfolio_return = np.dot(weight_vector, expected_returns)
+            portfolio_variance = np.dot(weight_vector, np.dot(cov_matrix, weight_vector))
+            portfolio_volatility = np.sqrt(portfolio_variance)
+            
+            # Calculate Sharpe ratio (assuming 2% risk-free rate)
+            risk_free_rate = 0.02
+            sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility if portfolio_volatility > 0 else 0.0
+            
+            return portfolio_return, portfolio_volatility, sharpe_ratio
+            
+        except Exception as e:
+            logger.error(f'Error calculating portfolio metrics: {e}')
+            return 0.0, 0.0, 0.0
+    
+    def optimize_portfolio_max_sharpe(returns_df: pd.DataFrame, max_weight: float = 0.3) -> OptimizationResult:
+        """Optimize portfolio for maximum Sharpe ratio"""
+        try:
+            if returns_df.empty or len(returns_df.columns) < 2:
+                return OptimizationResult({}, 0.0, 0.0, 0.0, "max_sharpe", 0.0)
+            
+            start_time = time.time()
+            
+            # Calculate expected returns and covariance matrix
+            expected_returns = returns_df.mean() * 252
+            cov_matrix = returns_df.cov() * 252
+            
+            # Use Ledoit-Wolf shrinkage for better covariance estimation
+            lw = LedoitWolf()
+            cov_matrix = lw.fit(returns_df).covariance_ * 252
+            
+            n_assets = len(returns_df.columns)
+            symbols = returns_df.columns.tolist()
+            
+            # Objective function: negative Sharpe ratio (to maximize)
+            def negative_sharpe(weights):
+                portfolio_return = np.dot(weights, expected_returns)
+                portfolio_variance = np.dot(weights, np.dot(cov_matrix, weights))
+                portfolio_volatility = np.sqrt(portfolio_variance)
+                
+                if portfolio_volatility == 0:
+                    return -1000  # Large negative value for zero volatility
+                
+                risk_free_rate = 0.02
+                sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
+                return -sharpe_ratio  # Negative because we want to maximize
+            
+            # Constraints: weights sum to 1
+            constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+            
+            # Bounds: each weight between 0 and max_weight
+            bounds = tuple((0, max_weight) for _ in range(n_assets))
+            
+            # Initial guess: equal weights
+            initial_weights = np.array([1.0/n_assets] * n_assets)
+            
+            # Optimize
+            result = minimize(
+                negative_sharpe,
+                initial_weights,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints,
+                options={'maxiter': 1000}
+            )
+            
+            if result.success:
+                optimal_weights = {symbols[i]: result.x[i] for i in range(n_assets) if result.x[i] > 0.001}
+                
+                # Calculate final metrics
+                portfolio_return, portfolio_volatility, sharpe_ratio = calculate_portfolio_metrics(
+                    optimal_weights, returns_df
+                )
+                
+                optimization_time_seconds = time.time() - start_time
+                
+                return OptimizationResult(
+                    weights=optimal_weights,
+                    expected_return=portfolio_return,
+                    volatility=portfolio_volatility,
+                    sharpe_ratio=sharpe_ratio,
+                    method="max_sharpe",
+                    optimization_time=optimization_time_seconds
+                )
+            else:
+                logger.error(f'Optimization failed: {result.message}')
+                return OptimizationResult({}, 0.0, 0.0, 0.0, "max_sharpe", 0.0)
+                
+        except Exception as e:
+            logger.error(f'Error in Sharpe optimization: {e}')
+            return OptimizationResult({}, 0.0, 0.0, 0.0, "max_sharpe", 0.0)
+    
+    def optimize_portfolio_min_volatility(returns_df: pd.DataFrame, max_weight: float = 0.3) -> OptimizationResult:
+        """Optimize portfolio for minimum volatility"""
+        try:
+            if returns_df.empty or len(returns_df.columns) < 2:
+                return OptimizationResult({}, 0.0, 0.0, 0.0, "min_volatility", 0.0)
+            
+            start_time = time.time()
+            
+            # Calculate covariance matrix
+            cov_matrix = returns_df.cov() * 252
+            
+            # Use Ledoit-Wolf shrinkage
+            lw = LedoitWolf()
+            cov_matrix = lw.fit(returns_df).covariance_ * 252
+            
+            n_assets = len(returns_df.columns)
+            symbols = returns_df.columns.tolist()
+            
+            # Objective function: portfolio variance
+            def portfolio_variance(weights):
+                return np.dot(weights, np.dot(cov_matrix, weights))
+            
+            # Constraints: weights sum to 1
+            constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+            
+            # Bounds: each weight between 0 and max_weight
+            bounds = tuple((0, max_weight) for _ in range(n_assets))
+            
+            # Initial guess: equal weights
+            initial_weights = np.array([1.0/n_assets] * n_assets)
+            
+            # Optimize
+            result = minimize(
+                portfolio_variance,
+                initial_weights,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints,
+                options={'maxiter': 1000}
+            )
+            
+            if result.success:
+                optimal_weights = {symbols[i]: result.x[i] for i in range(n_assets) if result.x[i] > 0.001}
+                
+                # Calculate final metrics
+                portfolio_return, portfolio_volatility, sharpe_ratio = calculate_portfolio_metrics(
+                    optimal_weights, returns_df
+                )
+                
+                optimization_time_seconds = time.time() - start_time
+                
+                return OptimizationResult(
+                    weights=optimal_weights,
+                    expected_return=portfolio_return,
+                    volatility=portfolio_volatility,
+                    sharpe_ratio=sharpe_ratio,
+                    method="min_volatility",
+                    optimization_time=optimization_time_seconds
+                )
+            else:
+                logger.error(f'Optimization failed: {result.message}')
+                return OptimizationResult({}, 0.0, 0.0, 0.0, "min_volatility", 0.0)
+                
+        except Exception as e:
+            logger.error(f'Error in volatility optimization: {e}')
+            return OptimizationResult({}, 0.0, 0.0, 0.0, "min_volatility", 0.0)
+    
+    def optimize_portfolio_equal_risk_contribution(returns_df: pd.DataFrame, max_weight: float = 0.3) -> OptimizationResult:
+        """Optimize portfolio for equal risk contribution (Risk Parity)"""
+        try:
+            if returns_df.empty or len(returns_df.columns) < 2:
+                return OptimizationResult({}, 0.0, 0.0, 0.0, "equal_risk", 0.0)
+            
+            start_time = time.time()
+            
+            # Calculate covariance matrix
+            cov_matrix = returns_df.cov() * 252
+            
+            # Use Ledoit-Wolf shrinkage
+            lw = LedoitWolf()
+            cov_matrix = lw.fit(returns_df).covariance_ * 252
+            
+            n_assets = len(returns_df.columns)
+            symbols = returns_df.columns.tolist()
+            
+            # Objective function: sum of squared differences from equal risk contribution
+            def risk_parity_objective(weights):
+                portfolio_variance = np.dot(weights, np.dot(cov_matrix, weights))
+                portfolio_volatility = np.sqrt(portfolio_variance)
+                
+                if portfolio_volatility == 0:
+                    return 1000
+                
+                # Calculate risk contributions
+                risk_contributions = (weights * np.dot(cov_matrix, weights)) / portfolio_variance
+                
+                # Target equal risk contribution
+                target_risk_contribution = 1.0 / n_assets
+                
+                # Sum of squared differences
+                return np.sum((risk_contributions - target_risk_contribution) ** 2)
+            
+            # Constraints: weights sum to 1
+            constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+            
+            # Bounds: each weight between 0 and max_weight
+            bounds = tuple((0, max_weight) for _ in range(n_assets))
+            
+            # Initial guess: equal weights
+            initial_weights = np.array([1.0/n_assets] * n_assets)
+            
+            # Optimize
+            result = minimize(
+                risk_parity_objective,
+                initial_weights,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints,
+                options={'maxiter': 1000}
+            )
+            
+            if result.success:
+                optimal_weights = {symbols[i]: result.x[i] for i in range(n_assets) if result.x[i] > 0.001}
+                
+                # Calculate final metrics
+                portfolio_return, portfolio_volatility, sharpe_ratio = calculate_portfolio_metrics(
+                    optimal_weights, returns_df
+                )
+                
+                optimization_time_seconds = time.time() - start_time
+                
+                return OptimizationResult(
+                    weights=optimal_weights,
+                    expected_return=portfolio_return,
+                    volatility=portfolio_volatility,
+                    sharpe_ratio=sharpe_ratio,
+                    method="equal_risk",
+                    optimization_time=optimization_time_seconds
+                )
+            else:
+                logger.error(f'Optimization failed: {result.message}')
+                return OptimizationResult({}, 0.0, 0.0, 0.0, "equal_risk", 0.0)
+                
+        except Exception as e:
+            logger.error(f'Error in risk parity optimization: {e}')
+            return OptimizationResult({}, 0.0, 0.0, 0.0, "equal_risk", 0.0)
+    
+    def get_current_portfolio() -> Dict[str, float]:
+        """Get current portfolio positions"""
+        try:
+            client = get_coinbase_client()
+            if not client:
+                return {}
+            
+            accounts = client.get_accounts()
+            portfolio = {}
+            
+            for account in accounts.accounts:
+                try:
+                    if hasattr(account.available_balance, 'value'):
+                        balance = float(account.available_balance.value)
+                    elif isinstance(account.available_balance, dict):
+                        balance = float(account.available_balance.get('value', 0))
+                    else:
+                        balance = float(account.available_balance)
+                    
+                    if balance > 0:
+                        portfolio[account.currency] = balance
+                except (ValueError, TypeError):
+                    continue
+            
+            return portfolio
+        except Exception as e:
+            logger.error(f'Error getting current portfolio: {e}')
+            return {}
+    
+    def calculate_rebalancing_needs(current_weights: Dict[str, float], target_weights: Dict[str, float], threshold: float = 0.05) -> Dict[str, float]:
+        """Calculate rebalancing needs"""
+        try:
+            rebalancing = {}
+            
+            # Get all unique symbols
+            all_symbols = set(current_weights.keys()) | set(target_weights.keys())
+            
+            for symbol in all_symbols:
+                current_weight = current_weights.get(symbol, 0.0)
+                target_weight = target_weights.get(symbol, 0.0)
+                
+                weight_diff = target_weight - current_weight
+                
+                # Only rebalance if difference exceeds threshold
+                if abs(weight_diff) > threshold:
+                    rebalancing[symbol] = weight_diff
+            
+            return rebalancing
+        except Exception as e:
+            logger.error(f'Error calculating rebalancing needs: {e}')
+            return {}
+    
+    def save_optimization_result(result: OptimizationResult):
+        """Save optimization result to database"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return
+            
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO portfolio_optimizations (
+                    method, weights, expected_return, volatility, sharpe_ratio,
+                    optimization_time, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            ''', (
+                result.method,
+                json.dumps(result.weights),
+                result.expected_return,
+                result.volatility,
+                result.sharpe_ratio,
+                result.optimization_time
+            ))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.info(f'Saved optimization result: {result.method} - Sharpe: {result.sharpe_ratio:.3f}')
+            
+        except Exception as e:
+            logger.error(f'Error saving optimization result: {e}')
+    
+    def portfolio_optimization_loop():
+        """Main portfolio optimization loop"""
+        symbols = ['BTC', 'ETH', 'ADA', 'DOT', 'LINK', 'SOL', 'MATIC', 'AVAX', 'ATOM', 'UNI']
+        
+        while True:
+            try:
+                logger.info('Running portfolio optimization...')
+                
+                # Get historical returns
+                returns_df = get_historical_returns(symbols, days=30)
+                
+                if returns_df.empty:
+                    logger.warning('No historical data available for optimization')
+                    time.sleep(300)  # Wait 5 minutes
+                    continue
+                
+                # Run different optimization methods
+                methods = [
+                    ('max_sharpe', optimize_portfolio_max_sharpe),
+                    ('min_volatility', optimize_portfolio_min_volatility),
+                    ('equal_risk', optimize_portfolio_equal_risk_contribution)
+                ]
+                
+                best_result = None
+                best_sharpe = -float('inf')
+                
+                for method_name, method_func in methods:
+                    try:
+                        result = method_func(returns_df, max_weight=0.3)
+                        
+                        if result.sharpe_ratio > best_sharpe:
+                            best_sharpe = result.sharpe_ratio
+                            best_result = result
+                        
+                        # Save result
+                        save_optimization_result(result)
+                        
+                        # Update metrics
+                        portfolio_optimizations.labels(method=method_name).inc()
+                        optimization_time.observe(result.optimization_time)
+                        
+                        logger.info(f'{method_name}: Sharpe={result.sharpe_ratio:.3f}, Vol={result.volatility:.3f}, Return={result.expected_return:.3f}')
+                        
+                    except Exception as e:
+                        logger.error(f'Error in {method_name} optimization: {e}')
+                
+                # Update portfolio metrics
+                if best_result:
+                    portfolio_sharpe_ratio.set(best_result.sharpe_ratio)
+                    portfolio_volatility.set(best_result.volatility)
+                    portfolio_expected_return.set(best_result.expected_return)
+                    
+                    # Check for rebalancing needs
+                    current_portfolio = get_current_portfolio()
+                    if current_portfolio:
+                        # Convert to weights (simplified)
+                        total_value = sum(current_portfolio.values())
+                        current_weights = {k: v/total_value for k, v in current_portfolio.items()}
+                        
+                        rebalancing_needs = calculate_rebalancing_needs(current_weights, best_result.weights)
+                        
+                        if rebalancing_needs:
+                            logger.info(f'Rebalancing needed: {rebalancing_needs}')
+                            rebalancing_events.labels(trigger='optimization').inc()
+                
+                # Wait 1 hour before next optimization
+                time.sleep(3600)
+                
+            except Exception as e:
+                logger.error(f'Error in portfolio optimization loop: {e}')
+                time.sleep(300)
+    
+    @app.get('/health')
+    async def health_check():
+        return {
+            'status': 'healthy',
+            'service': 'portfolio-optimization',
+            'methods': [
+                'max_sharpe',
+                'min_volatility',
+                'equal_risk_contribution'
+            ]
+        }
+    
+    @app.get('/metrics')
+    async def metrics():
+        return Response(content=generate_latest(), media_type='text/plain')
+    
+    @app.post('/optimize-portfolio')
+    async def optimize_portfolio_endpoint(
+        symbols: List[str] = None,
+        method: str = 'max_sharpe',
+        days: int = 30,
+        max_weight: float = 0.3
+    ):
+        try:
+            if symbols is None:
+                symbols = ['BTC', 'ETH', 'ADA', 'DOT', 'LINK']
+            
+            # Get historical returns
+            returns_df = get_historical_returns(symbols, days)
+            
+            if returns_df.empty:
+                raise HTTPException(status_code=400, detail="No historical data available")
+            
+            # Run optimization based on method
+            if method == 'max_sharpe':
+                result = optimize_portfolio_max_sharpe(returns_df, max_weight)
+            elif method == 'min_volatility':
+                result = optimize_portfolio_min_volatility(returns_df, max_weight)
+            elif method == 'equal_risk':
+                result = optimize_portfolio_equal_risk_contribution(returns_df, max_weight)
+            else:
+                raise HTTPException(status_code=400, detail="Invalid optimization method")
+            
+            return {
+                'success': True,
+                'method': result.method,
+                'weights': result.weights,
+                'expected_return': result.expected_return,
+                'volatility': result.volatility,
+                'sharpe_ratio': result.sharpe_ratio,
+                'optimization_time': result.optimization_time
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get('/current-portfolio')
+    async def get_current_portfolio_endpoint():
+        try:
+            portfolio = get_current_portfolio()
+            return {
+                'success': True,
+                'portfolio': portfolio,
+                'total_assets': len(portfolio)
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get('/rebalancing-analysis')
+    async def get_rebalancing_analysis():
+        try:
+            # Get current portfolio
+            current_portfolio = get_current_portfolio()
+            if not current_portfolio:
+                return {'success': False, 'error': 'No current portfolio data'}
+            
+            # Get latest optimization result
+            conn = get_db_connection()
+            if not conn:
+                return {'success': False, 'error': 'Database connection failed'}
+            
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT method, weights, expected_return, volatility, sharpe_ratio
+                FROM portfolio_optimizations 
+                ORDER BY created_at DESC 
+                LIMIT 1
+            ''')
+            
+            result = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            if not result:
+                return {'success': False, 'error': 'No optimization results available'}
+            
+            method, weights_json, expected_return, volatility, sharpe_ratio = result
+            target_weights = json.loads(weights_json)
+            
+            # Convert current portfolio to weights
+            total_value = sum(current_portfolio.values())
+            current_weights = {k: v/total_value for k, v in current_portfolio.items()}
+            
+            # Calculate rebalancing needs
+            rebalancing_needs = calculate_rebalancing_needs(current_weights, target_weights)
+            
+            return {
+                'success': True,
+                'current_weights': current_weights,
+                'target_weights': target_weights,
+                'rebalancing_needs': rebalancing_needs,
+                'optimization_method': method,
+                'expected_return': expected_return,
+                'volatility': volatility,
+                'sharpe_ratio': sharpe_ratio
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    if __name__ == '__main__':
+        logger.info('🚀 Starting Advanced Portfolio Optimization Service')
+        
+        # Start optimization loop in background
+        import threading
+        optimization_thread = threading.Thread(target=portfolio_optimization_loop, daemon=True)
+        optimization_thread.start()
+        
+        logger.info('✅ Portfolio optimization service ready')
+        uvicorn.run(app, host='0.0.0.0', port=8029)
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portfolio-optimization-service
+  namespace: crypto-trading
+  labels:
+    app: portfolio-optimization-service
+    component: portfolio-optimization
+    node-type: analytics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: portfolio-optimization-service
+  template:
+    metadata:
+      labels:
+        app: portfolio-optimization-service
+        component: portfolio-optimization
+        node-type: analytics
+    spec:
+      nodeSelector:
+        node-name: cryptoai-risk-analytics
+      tolerations:
+      - key: analytics-infrastructure
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      containers:
+      - name: portfolio-optimization-service
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8029
+          name: http
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn requests mysql-connector-python pandas numpy scikit-learn scipy prometheus_client coinbase-advanced-py
+          python /app/portfolio_optimization_service.py
+        envFrom:
+        - configMapRef:
+            name: crypto-trading-config
+        - configMapRef:
+            name: database-config
+        - secretRef:
+            name: database-secrets
+        - secretRef:
+            name: coinbase-api-secrets
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+          requests:
+            cpu: 200m
+            memory: 512Mi
+      volumes:
+      - name: app-code
+        configMap:
+          name: portfolio-optimization-code
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portfolio-optimization-service
+  namespace: crypto-trading
+  labels:
+    app: portfolio-optimization-service
+    component: portfolio-optimization
+spec:
+  selector:
+    app: portfolio-optimization-service
+  ports:
+  - port: 8029
+    targetPort: 8029
+    protocol: TCP
+  type: ClusterIP

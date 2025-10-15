@@ -1,0 +1,686 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backtesting-service-code
+  namespace: crypto-trading
+  labels:
+    app: backtesting-service
+    component: backtesting
+data:
+  backtesting_service.py: |
+    import os
+    import time
+    import json
+    import mysql.connector
+    import requests
+    import pandas as pd
+    import numpy as np
+    from datetime import datetime, timedelta
+    from fastapi import FastAPI, HTTPException
+    import uvicorn
+    import logging
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest
+    from typing import Dict, List, Optional, Tuple
+    from dataclasses import dataclass
+    import warnings
+    warnings.filterwarnings('ignore')
+    
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
+    # Prometheus metrics
+    backtests_performed = Counter('backtests_performed_total', 'Total backtests performed', ['strategy', 'symbol'])
+    backtest_duration = Histogram('backtest_duration_seconds', 'Backtest execution time')
+    strategy_performance = Gauge('strategy_performance', 'Strategy performance metrics', ['strategy', 'metric'])
+    
+    app = FastAPI(title='Comprehensive Backtesting Service')
+    
+    @dataclass
+    class BacktestResult:
+        strategy_name: str
+        symbol: str
+        start_date: str
+        end_date: str
+        initial_capital: float
+        final_capital: float
+        total_return: float
+        annualized_return: float
+        volatility: float
+        sharpe_ratio: float
+        max_drawdown: float
+        win_rate: float
+        total_trades: int
+        profitable_trades: int
+        parameters: Dict
+        trades: List[Dict]
+    
+    def get_db_connection():
+        try:
+            return mysql.connector.connect(
+                host=os.getenv('DB_HOST'),
+                user=os.getenv('DB_USER'),
+                password=os.getenv('DB_PASSWORD'),
+                database=os.getenv('DB_NAME_PRICES')
+            )
+        except Exception as e:
+            logger.error(f'Database connection error: {e}')
+            return None
+    
+    def get_historical_data(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """Get historical price data for backtesting"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return pd.DataFrame()
+            
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT timestamp, price, volume
+                FROM crypto_prices 
+                WHERE symbol = %s 
+                AND timestamp >= %s 
+                AND timestamp <= %s
+                ORDER BY timestamp ASC
+            ''', (symbol, start_date, end_date))
+            
+            data = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            if not data:
+                return pd.DataFrame()
+            
+            df = pd.DataFrame(data, columns=['timestamp', 'price', 'volume'])
+            df['price'] = pd.to_numeric(df['price'])
+            df['volume'] = pd.to_numeric(df['volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.set_index('timestamp')
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f'Error getting historical data for {symbol}: {e}')
+            return pd.DataFrame()
+    
+    def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate technical indicators for backtesting"""
+        try:
+            if df.empty or len(df) < 20:
+                return df
+            
+            # Moving averages
+            df['sma_20'] = df['price'].rolling(window=20).mean()
+            df['sma_50'] = df['price'].rolling(window=50).mean()
+            df['ema_12'] = df['price'].ewm(span=12).mean()
+            df['ema_26'] = df['price'].ewm(span=26).mean()
+            
+            # MACD
+            df['macd'] = df['ema_12'] - df['ema_26']
+            df['macd_signal'] = df['macd'].ewm(span=9).mean()
+            df['macd_histogram'] = df['macd'] - df['macd_signal']
+            
+            # RSI
+            delta = df['price'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            df['rsi'] = 100 - (100 / (1 + rs))
+            
+            # Bollinger Bands
+            df['bb_middle'] = df['price'].rolling(window=20).mean()
+            bb_std = df['price'].rolling(window=20).std()
+            df['bb_upper'] = df['bb_middle'] + (bb_std * 2)
+            df['bb_lower'] = df['bb_middle'] - (bb_std * 2)
+            
+            # Price momentum
+            df['momentum_5'] = df['price'].pct_change(5)
+            df['momentum_10'] = df['price'].pct_change(10)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f'Error calculating technical indicators: {e}')
+            return df
+    
+    def momentum_strategy_backtest(df: pd.DataFrame, initial_capital: float = 10000) -> BacktestResult:
+        """Backtest momentum strategy"""
+        try:
+            if df.empty or len(df) < 50:
+                return None
+            
+            capital = initial_capital
+            position = 0
+            trades = []
+            portfolio_values = []
+            
+            for i in range(50, len(df)):
+                current_price = df['price'].iloc[i]
+                current_date = df.index[i]
+                
+                # Momentum buy signal
+                if (df['sma_20'].iloc[i] > df['sma_50'].iloc[i] and 
+                    current_price > df['sma_20'].iloc[i] and 
+                    df['rsi'].iloc[i] < 70 and 
+                    df['macd'].iloc[i] > df['macd_signal'].iloc[i] and 
+                    df['momentum_5'].iloc[i] > 0.02 and
+                    position == 0):
+                    
+                    # Buy
+                    shares = capital / current_price
+                    position = shares
+                    capital = 0
+                    
+                    trades.append({
+                        'type': 'BUY',
+                        'date': current_date,
+                        'price': current_price,
+                        'quantity': shares,
+                        'capital_used': capital + (shares * current_price)
+                    })
+                
+                # Momentum sell signal
+                elif (df['sma_20'].iloc[i] < df['sma_50'].iloc[i] and 
+                      current_price < df['sma_20'].iloc[i] and 
+                      df['rsi'].iloc[i] > 30 and 
+                      df['macd'].iloc[i] < df['macd_signal'].iloc[i] and 
+                      df['momentum_5'].iloc[i] < -0.02 and
+                      position > 0):
+                    
+                    # Sell
+                    capital = position * current_price
+                    
+                    trades.append({
+                        'type': 'SELL',
+                        'date': current_date,
+                        'price': current_price,
+                        'quantity': position,
+                        'capital_gained': capital
+                    })
+                    
+                    position = 0
+                
+                # Calculate portfolio value
+                if position > 0:
+                    portfolio_value = position * current_price
+                else:
+                    portfolio_value = capital
+                
+                portfolio_values.append(portfolio_value)
+            
+            # Final portfolio value
+            if position > 0:
+                final_capital = position * df['price'].iloc[-1]
+            else:
+                final_capital = capital
+            
+            # Calculate metrics
+            total_return = (final_capital - initial_capital) / initial_capital
+            
+            # Calculate annualized return
+            days = (df.index[-1] - df.index[0]).days
+            annualized_return = (1 + total_return) ** (365 / days) - 1 if days > 0 else 0
+            
+            # Calculate volatility
+            returns = pd.Series(portfolio_values).pct_change().dropna()
+            volatility = returns.std() * np.sqrt(252) if len(returns) > 1 else 0
+            
+            # Calculate Sharpe ratio
+            risk_free_rate = 0.02
+            sharpe_ratio = (annualized_return - risk_free_rate) / volatility if volatility > 0 else 0
+            
+            # Calculate maximum drawdown
+            peak = pd.Series(portfolio_values).expanding().max()
+            drawdown = (pd.Series(portfolio_values) - peak) / peak
+            max_drawdown = drawdown.min()
+            
+            # Calculate win rate
+            profitable_trades = 0
+            total_trades = len(trades) // 2  # Each trade has buy and sell
+            
+            for i in range(0, len(trades) - 1, 2):
+                if i + 1 < len(trades):
+                    buy_trade = trades[i]
+                    sell_trade = trades[i + 1]
+                    if sell_trade['capital_gained'] > buy_trade['capital_used']:
+                        profitable_trades += 1
+            
+            win_rate = profitable_trades / total_trades if total_trades > 0 else 0
+            
+            return BacktestResult(
+                strategy_name="momentum",
+                symbol=df.index[0].strftime('%Y-%m-%d') if not df.empty else "unknown",
+                start_date=df.index[0].strftime('%Y-%m-%d') if not df.empty else "unknown",
+                end_date=df.index[-1].strftime('%Y-%m-%d') if not df.empty else "unknown",
+                initial_capital=initial_capital,
+                final_capital=final_capital,
+                total_return=total_return,
+                annualized_return=annualized_return,
+                volatility=volatility,
+                sharpe_ratio=sharpe_ratio,
+                max_drawdown=max_drawdown,
+                win_rate=win_rate,
+                total_trades=total_trades,
+                profitable_trades=profitable_trades,
+                parameters={"sma_periods": [20, 50], "rsi_period": 14, "momentum_threshold": 0.02},
+                trades=trades
+            )
+            
+        except Exception as e:
+            logger.error(f'Error in momentum strategy backtest: {e}')
+            return None
+    
+    def mean_reversion_strategy_backtest(df: pd.DataFrame, initial_capital: float = 10000) -> BacktestResult:
+        """Backtest mean reversion strategy"""
+        try:
+            if df.empty or len(df) < 50:
+                return None
+            
+            capital = initial_capital
+            position = 0
+            trades = []
+            portfolio_values = []
+            
+            for i in range(50, len(df)):
+                current_price = df['price'].iloc[i]
+                current_date = df.index[i]
+                
+                # Mean reversion buy signal (oversold)
+                if (current_price <= df['bb_lower'].iloc[i] and 
+                    df['rsi'].iloc[i] < 30 and 
+                    df['momentum_5'].iloc[i] < -0.05 and
+                    position == 0):
+                    
+                    # Buy
+                    shares = capital / current_price
+                    position = shares
+                    capital = 0
+                    
+                    trades.append({
+                        'type': 'BUY',
+                        'date': current_date,
+                        'price': current_price,
+                        'quantity': shares,
+                        'capital_used': capital + (shares * current_price)
+                    })
+                
+                # Mean reversion sell signal (overbought)
+                elif (current_price >= df['bb_upper'].iloc[i] and 
+                      df['rsi'].iloc[i] > 70 and 
+                      df['momentum_5'].iloc[i] > 0.05 and
+                      position > 0):
+                    
+                    # Sell
+                    capital = position * current_price
+                    
+                    trades.append({
+                        'type': 'SELL',
+                        'date': current_date,
+                        'price': current_price,
+                        'quantity': position,
+                        'capital_gained': capital
+                    })
+                    
+                    position = 0
+                
+                # Calculate portfolio value
+                if position > 0:
+                    portfolio_value = position * current_price
+                else:
+                    portfolio_value = capital
+                
+                portfolio_values.append(portfolio_value)
+            
+            # Final portfolio value
+            if position > 0:
+                final_capital = position * df['price'].iloc[-1]
+            else:
+                final_capital = capital
+            
+            # Calculate metrics (same as momentum strategy)
+            total_return = (final_capital - initial_capital) / initial_capital
+            
+            days = (df.index[-1] - df.index[0]).days
+            annualized_return = (1 + total_return) ** (365 / days) - 1 if days > 0 else 0
+            
+            returns = pd.Series(portfolio_values).pct_change().dropna()
+            volatility = returns.std() * np.sqrt(252) if len(returns) > 1 else 0
+            
+            risk_free_rate = 0.02
+            sharpe_ratio = (annualized_return - risk_free_rate) / volatility if volatility > 0 else 0
+            
+            peak = pd.Series(portfolio_values).expanding().max()
+            drawdown = (pd.Series(portfolio_values) - peak) / peak
+            max_drawdown = drawdown.min()
+            
+            profitable_trades = 0
+            total_trades = len(trades) // 2
+            
+            for i in range(0, len(trades) - 1, 2):
+                if i + 1 < len(trades):
+                    buy_trade = trades[i]
+                    sell_trade = trades[i + 1]
+                    if sell_trade['capital_gained'] > buy_trade['capital_used']:
+                        profitable_trades += 1
+            
+            win_rate = profitable_trades / total_trades if total_trades > 0 else 0
+            
+            return BacktestResult(
+                strategy_name="mean_reversion",
+                symbol=df.index[0].strftime('%Y-%m-%d') if not df.empty else "unknown",
+                start_date=df.index[0].strftime('%Y-%m-%d') if not df.empty else "unknown",
+                end_date=df.index[-1].strftime('%Y-%m-%d') if not df.empty else "unknown",
+                initial_capital=initial_capital,
+                final_capital=final_capital,
+                total_return=total_return,
+                annualized_return=annualized_return,
+                volatility=volatility,
+                sharpe_ratio=sharpe_ratio,
+                max_drawdown=max_drawdown,
+                win_rate=win_rate,
+                total_trades=total_trades,
+                profitable_trades=profitable_trades,
+                parameters={"bb_period": 20, "bb_std": 2, "rsi_period": 14, "momentum_threshold": 0.05},
+                trades=trades
+            )
+            
+        except Exception as e:
+            logger.error(f'Error in mean reversion strategy backtest: {e}')
+            return None
+    
+    def save_backtest_result(result: BacktestResult):
+        """Save backtest result to database"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return
+            
+            cursor = conn.cursor()
+            
+            # Insert backtest result
+            cursor.execute('''
+                INSERT INTO backtesting_results (
+                    strategy_name, symbol, start_date, end_date, initial_capital,
+                    final_capital, total_return, annualized_return, volatility,
+                    sharpe_ratio, max_drawdown, win_rate, total_trades,
+                    profitable_trades, parameters, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ''', (
+                result.strategy_name,
+                result.symbol,
+                result.start_date,
+                result.end_date,
+                result.initial_capital,
+                result.final_capital,
+                result.total_return,
+                result.annualized_return,
+                result.volatility,
+                result.sharpe_ratio,
+                result.max_drawdown,
+                result.win_rate,
+                result.total_trades,
+                result.profitable_trades,
+                json.dumps(result.parameters)
+            ))
+            
+            backtest_id = cursor.lastrowid
+            
+            # Insert individual trades
+            for trade in result.trades:
+                cursor.execute('''
+                    INSERT INTO backtesting_trades (
+                        backtesting_result_id, symbol, trade_type, entry_price,
+                        quantity, entry_date, strategy_signal, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                ''', (
+                    backtest_id,
+                    result.symbol,
+                    trade['type'],
+                    trade['price'],
+                    trade['quantity'],
+                    trade['date'],
+                    result.strategy_name
+                ))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.info(f'Saved backtest result: {result.strategy_name} - Return: {result.total_return:.2%}, Sharpe: {result.sharpe_ratio:.3f}')
+            
+        except Exception as e:
+            logger.error(f'Error saving backtest result: {e}')
+    
+    def run_comprehensive_backtest(symbol: str, start_date: str, end_date: str, initial_capital: float = 10000) -> List[BacktestResult]:
+        """Run comprehensive backtest for all strategies"""
+        try:
+            logger.info(f'Running comprehensive backtest for {symbol} from {start_date} to {end_date}')
+            
+            # Get historical data
+            df = get_historical_data(symbol, start_date, end_date)
+            if df.empty:
+                logger.warning(f'No historical data available for {symbol}')
+                return []
+            
+            # Calculate technical indicators
+            df = calculate_technical_indicators(df)
+            
+            # Run different strategy backtests
+            strategies = [
+                ('momentum', momentum_strategy_backtest),
+                ('mean_reversion', mean_reversion_strategy_backtest)
+            ]
+            
+            results = []
+            for strategy_name, strategy_func in strategies:
+                try:
+                    start_time = time.time()
+                    result = strategy_func(df, initial_capital)
+                    
+                    if result:
+                        result.symbol = symbol  # Set the correct symbol
+                        results.append(result)
+                        
+                        # Save result
+                        save_backtest_result(result)
+                        
+                        # Update metrics
+                        backtests_performed.labels(strategy=strategy_name, symbol=symbol).inc()
+                        backtest_duration.observe(time.time() - start_time)
+                        
+                        logger.info(f'{strategy_name} backtest completed: Return={result.total_return:.2%}, Sharpe={result.sharpe_ratio:.3f}')
+                    
+                except Exception as e:
+                    logger.error(f'Error in {strategy_name} backtest: {e}')
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f'Error in comprehensive backtest: {e}')
+            return []
+    
+    @app.get('/health')
+    async def health_check():
+        return {
+            'status': 'healthy',
+            'service': 'comprehensive-backtesting',
+            'strategies': ['momentum', 'mean_reversion']
+        }
+    
+    @app.get('/metrics')
+    async def metrics():
+        return Response(content=generate_latest(), media_type='text/plain')
+    
+    @app.post('/run-backtest')
+    async def run_backtest_endpoint(
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        initial_capital: float = 10000
+    ):
+        try:
+            results = run_comprehensive_backtest(symbol, start_date, end_date, initial_capital)
+            
+            if not results:
+                raise HTTPException(status_code=400, detail="No backtest results generated")
+            
+            # Convert results to dict for JSON response
+            results_dict = []
+            for result in results:
+                results_dict.append({
+                    'strategy_name': result.strategy_name,
+                    'symbol': result.symbol,
+                    'start_date': result.start_date,
+                    'end_date': result.end_date,
+                    'initial_capital': result.initial_capital,
+                    'final_capital': result.final_capital,
+                    'total_return': result.total_return,
+                    'annualized_return': result.annualized_return,
+                    'volatility': result.volatility,
+                    'sharpe_ratio': result.sharpe_ratio,
+                    'max_drawdown': result.max_drawdown,
+                    'win_rate': result.win_rate,
+                    'total_trades': result.total_trades,
+                    'profitable_trades': result.profitable_trades,
+                    'parameters': result.parameters
+                })
+            
+            return {
+                'success': True,
+                'results': results_dict,
+                'count': len(results_dict)
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get('/backtest-results')
+    async def get_backtest_results(limit: int = 10):
+        try:
+            conn = get_db_connection()
+            if not conn:
+                raise HTTPException(status_code=500, detail="Database connection failed")
+            
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT strategy_name, symbol, start_date, end_date, total_return,
+                       annualized_return, volatility, sharpe_ratio, max_drawdown,
+                       win_rate, total_trades, created_at
+                FROM backtesting_results 
+                ORDER BY created_at DESC 
+                LIMIT %s
+            ''', (limit,))
+            
+            results = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            results_dict = []
+            for result in results:
+                results_dict.append({
+                    'strategy_name': result[0],
+                    'symbol': result[1],
+                    'start_date': result[2].strftime('%Y-%m-%d') if result[2] else None,
+                    'end_date': result[3].strftime('%Y-%m-%d') if result[3] else None,
+                    'total_return': float(result[4]),
+                    'annualized_return': float(result[5]),
+                    'volatility': float(result[6]),
+                    'sharpe_ratio': float(result[7]),
+                    'max_drawdown': float(result[8]),
+                    'win_rate': float(result[9]),
+                    'total_trades': result[10],
+                    'created_at': result[11].strftime('%Y-%m-%d %H:%M:%S') if result[11] else None
+                })
+            
+            return {
+                'success': True,
+                'results': results_dict,
+                'count': len(results_dict)
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    if __name__ == '__main__':
+        logger.info('🚀 Starting Comprehensive Backtesting Service')
+        logger.info('✅ Backtesting service ready')
+        uvicorn.run(app, host='0.0.0.0', port=8030)
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backtesting-service
+  namespace: crypto-trading
+  labels:
+    app: backtesting-service
+    component: backtesting
+    node-type: analytics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backtesting-service
+  template:
+    metadata:
+      labels:
+        app: backtesting-service
+        component: backtesting
+        node-type: analytics
+    spec:
+      nodeSelector:
+        node-name: cryptoai-risk-analytics
+      tolerations:
+      - key: analytics-infrastructure
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      containers:
+      - name: backtesting-service
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8030
+          name: http
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn requests mysql-connector-python pandas numpy scikit-learn prometheus_client
+          python /app/backtesting_service.py
+        envFrom:
+        - configMapRef:
+            name: crypto-trading-config
+        - configMapRef:
+            name: database-config
+        - secretRef:
+            name: database-secrets
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+          requests:
+            cpu: 200m
+            memory: 512Mi
+      volumes:
+      - name: app-code
+        configMap:
+          name: backtesting-service-code
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backtesting-service
+  namespace: crypto-trading
+  labels:
+    app: backtesting-service
+    component: backtesting
+spec:
+  selector:
+    app: backtesting-service
+  ports:
+  - port: 8030
+    targetPort: 8030
+    protocol: TCP
+  type: ClusterIP
