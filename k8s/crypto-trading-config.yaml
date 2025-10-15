@@ -7,11 +7,9 @@ metadata:
     app: crypto-trading-system
     component: config
 data:
-  # Database Configuration
-  DB_HOST: "172.22.32.1"
-  DB_USER: "news_collector"
-  DB_NAME_PRICES: "crypto_prices"
-  DB_NAME_TRANSACTIONS: "crypto_transactions"
+  # Database Configuration - Now centralized in database-config ConfigMap
+  # All database settings are managed in k8s/database-config.yaml
+  # To change database location, update DB_HOST in database-config.yaml
   
   # Service URLs
   SIGNAL_BRIDGE_URL: "http://signal-bridge:8022"

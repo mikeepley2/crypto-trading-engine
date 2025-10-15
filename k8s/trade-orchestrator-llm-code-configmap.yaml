@@ -1,0 +1,322 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trade-orchestrator-llm-code
+  namespace: crypto-trading
+  labels:
+    app: trade-orchestrator-llm
+    component: orchestration
+data:
+  trade_orchestrator_llm.py: |
+    import os
+    import time
+    import json
+    import mysql.connector
+    import requests
+    from datetime import datetime, timedelta
+    from fastapi import FastAPI, HTTPException
+    import uvicorn
+    import logging
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest
+    from typing import Dict, List, Optional
+    
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
+    # Prometheus metrics
+    recommendations_created = Counter('recommendations_created_total', 'Total trade recommendations created', ['symbol', 'signal_type'])
+    trades_executed = Counter('trades_executed_total', 'Total trades executed', ['symbol', 'status'])
+    orchestration_errors = Counter('orchestration_errors_total', 'Total orchestration errors', ['error_type'])
+    
+    app = FastAPI(title='Trade Orchestrator LLM')
+    
+    def get_db_connection():
+        """Get database connection"""
+        try:
+            return mysql.connector.connect(
+                host=os.getenv('DB_HOST'),
+                user=os.getenv('DB_USER'),
+                password=os.getenv('DB_PASSWORD'),
+                database=os.getenv('DB_NAME_PRICES')
+            )
+        except Exception as e:
+            logger.error(f'Database connection error: {e}')
+            return None
+    
+    def create_trade_recommendation(signal):
+        """Create a trade recommendation from a signal"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return False
+            
+            cursor = conn.cursor()
+            
+            # Calculate trade amount based on signal confidence
+            base_amount = 50.0  # Base amount in USD
+            confidence_multiplier = float(signal['confidence'])
+            amount_usd = base_amount * confidence_multiplier
+            
+            # Create trade recommendation
+            cursor.execute('''
+                INSERT INTO trade_recommendations (
+                    symbol, signal_type, amount_usd, confidence, reasoning, 
+                    execution_status, created_at, is_mock
+                ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s)
+            ''', (
+                signal['symbol'], 
+                signal['signal_type'], 
+                amount_usd, 
+                signal['confidence'], 
+                signal['reasoning'],
+                'PENDING',
+                0  # Not mock
+            ))
+            
+            conn.commit()
+            recommendation_id = cursor.lastrowid
+            
+            cursor.close()
+            conn.close()
+            
+            logger.info(f'Created trade recommendation {recommendation_id}: {signal["symbol"]} {signal["signal_type"]} ${amount_usd}')
+            recommendations_created.labels(
+                symbol=signal['symbol'],
+                signal_type=signal['signal_type']
+            ).inc()
+            
+            return recommendation_id
+            
+        except Exception as e:
+            logger.error(f'Error creating trade recommendation: {e}')
+            orchestration_errors.labels(error_type='recommendation_creation').inc()
+            return False
+    
+    def execute_trade_recommendation(recommendation):
+        """Execute a trade recommendation"""
+        try:
+            # Call real trade executor service
+            trade_data = {
+                'symbol': recommendation['symbol'],
+                'side': recommendation['signal_type'],
+                'amount_usd': float(recommendation['amount_usd'])
+            }
+            
+            logger.info(f'Executing real trade: {trade_data}')
+            
+            # Call the real trade executor service
+            trade_executor_url = 'http://trade-executor-real:8024'
+            
+            response = requests.post(
+                f'{trade_executor_url}/execute-trade',
+                json=trade_data,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                
+                if result.get('success'):
+                    # Update recommendation status to EXECUTED
+                    conn = get_db_connection()
+                    if conn:
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            UPDATE trade_recommendations 
+                            SET execution_status = 'EXECUTED', executed_at = NOW()
+                            WHERE id = %s
+                        ''', (recommendation['id'],))
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
+                    
+                    logger.info(f'Real trade executed successfully: {recommendation["symbol"]} {recommendation["signal_type"]} - Order ID: {result.get("order_id", "Unknown")}')
+                    trades_executed.labels(
+                        symbol=recommendation['symbol'],
+                        status='success'
+                    ).inc()
+                    
+                    return True
+                else:
+                    # Trade failed - update status to FAILED
+                    conn = get_db_connection()
+                    if conn:
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            UPDATE trade_recommendations 
+                            SET execution_status = 'FAILED', executed_at = NOW()
+                            WHERE id = %s
+                        ''', (recommendation['id'],))
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
+                    
+                    logger.warning(f'Trade execution failed: {recommendation["symbol"]} {recommendation["signal_type"]} - {result.get("error", "Unknown error")}')
+                    trades_executed.labels(
+                        symbol=recommendation['symbol'],
+                        status='failed'
+                    ).inc()
+                    
+                    return False
+            else:
+                logger.error(f'Trade executor returned status {response.status_code}: {response.text}')
+                orchestration_errors.labels(error_type='trade_execution').inc()
+                return False
+            
+        except Exception as e:
+            logger.error(f'Error executing trade: {e}')
+            orchestration_errors.labels(error_type='trade_execution').inc()
+            return False
+    
+    def process_signals():
+        """Process new signals and create trade recommendations"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return
+            
+            cursor = conn.cursor()
+            
+            # Get recent signals that haven't been processed
+            cursor.execute('''
+                SELECT id, symbol, signal_type, confidence, llm_reasoning, created_at
+                FROM trading_signals 
+                WHERE created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                AND processed = 0
+                ORDER BY created_at DESC
+                LIMIT 10
+            ''')
+            
+            signals = cursor.fetchall()
+            
+            for signal in signals:
+                signal_data = {
+                    'id': signal[0],
+                    'symbol': signal[1],
+                    'signal_type': signal[2],
+                    'confidence': signal[3],
+                    'reasoning': signal[4],
+                    'created_at': signal[5]
+                }
+                
+                # Create trade recommendation
+                recommendation_id = create_trade_recommendation(signal_data)
+                
+                if recommendation_id:
+                    # Mark signal as processed
+                    cursor.execute('''
+                        UPDATE trading_signals 
+                        SET processed = 1 
+                        WHERE id = %s
+                    ''', (signal[0],))
+                    
+                    logger.info(f'Processed signal {signal[0]}: {signal[1]} {signal[2]}')
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f'Error processing signals: {e}')
+            orchestration_errors.labels(error_type='signal_processing').inc()
+    
+    def process_pending_recommendations():
+        """Process pending trade recommendations"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return
+            
+            cursor = conn.cursor()
+            
+            # Get pending recommendations (only BUY and SELL, not HOLD)
+            cursor.execute('''
+                SELECT id, symbol, signal_type, amount_usd, confidence, reasoning
+                FROM trade_recommendations 
+                WHERE execution_status = 'PENDING'
+                AND signal_type IN ('BUY', 'SELL')
+                AND created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                ORDER BY created_at ASC
+                LIMIT 5
+            ''')
+            
+            recommendations = cursor.fetchall()
+            
+            for rec in recommendations:
+                recommendation = {
+                    'id': rec[0],
+                    'symbol': rec[1],
+                    'signal_type': rec[2],
+                    'amount_usd': rec[3],
+                    'confidence': rec[4],
+                    'reasoning': rec[5]
+                }
+                
+                # Execute the trade
+                success = execute_trade_recommendation(recommendation)
+                
+                if success:
+                    logger.info(f'Executed recommendation {rec[0]}: {rec[1]} {rec[2]}')
+            
+            cursor.close()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f'Error processing recommendations: {e}')
+            orchestration_errors.labels(error_type='recommendation_processing').inc()
+    
+    def orchestration_loop():
+        """Main orchestration loop"""
+        while True:
+            try:
+                logger.info('Running orchestration cycle...')
+                
+                # Process new signals
+                process_signals()
+                
+                # Process pending recommendations
+                process_pending_recommendations()
+                
+                # Wait 30 seconds before next cycle
+                time.sleep(30)
+                
+            except Exception as e:
+                logger.error(f'Error in orchestration loop: {e}')
+                time.sleep(60)
+    
+    @app.get('/health')
+    async def health_check():
+        return {'status': 'healthy', 'service': 'trade-orchestrator-llm'}
+    
+    @app.get('/metrics')
+    async def metrics():
+        return Response(content=generate_latest(), media_type='text/plain')
+    
+    @app.post('/process-signals')
+    async def process_signals_endpoint():
+        """Manually trigger signal processing"""
+        try:
+            process_signals()
+            return {'success': True, 'message': 'Signals processed'}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post('/process-recommendations')
+    async def process_recommendations_endpoint():
+        """Manually trigger recommendation processing"""
+        try:
+            process_pending_recommendations()
+            return {'success': True, 'message': 'Recommendations processed'}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    if __name__ == '__main__':
+        logger.info('🚀 Starting Trade Orchestrator LLM')
+        
+        # Start orchestration loop in background
+        import threading
+        orchestration_thread = threading.Thread(target=orchestration_loop, daemon=True)
+        orchestration_thread.start()
+        
+        logger.info('✅ Trade orchestrator ready - processing signals and recommendations')
+        uvicorn.run(app, host='0.0.0.0', port=8023)

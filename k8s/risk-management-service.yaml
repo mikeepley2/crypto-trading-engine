@@ -26,7 +26,7 @@ spec:
         args:
         - |
           # Install dependencies
-          pip install fastapi uvicorn requests mysql-connector-python pandas numpy scikit-learn
+          pip install fastapi uvicorn requests mysql-connector-python pandas numpy scikit-learn prometheus_client
           
           # Create the risk management service
           python -c "
@@ -49,10 +49,10 @@ spec:
           app = FastAPI(title='Risk Management Service', version='1.0.0')
           
           # Database configuration
-          DB_HOST = os.getenv('DB_HOST', '172.22.32.1')
-          DB_USER = os.getenv('DB_USER', 'news_collector')
-          DB_PASSWORD = os.getenv('DB_PASSWORD', '99Rules!')
-          DB_NAME = os.getenv('DB_NAME', 'crypto_prices')
+          DB_HOST = os.getenv('DB_HOST')
+          DB_USER = os.getenv('DB_USER')
+          DB_PASSWORD = os.getenv('DB_PASSWORD')
+          DB_NAME = os.getenv('DB_NAME_PRICES')
           
           def get_db_connection():
               return mysql.connector.connect(

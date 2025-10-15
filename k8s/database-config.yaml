@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: database-config
+  namespace: crypto-trading
+  labels:
+    app: crypto-trading-system
+    component: database-config
+data:
+  # Centralized Database Configuration
+  # Change DB_HOST to update database location for all services
+  DB_HOST: "172.22.32.1"  # <-- SINGLE POINT OF CHANGE FOR DATABASE LOCATION
+  DB_PORT: "3306"
+  DB_USER: "news_collector"
+  DB_NAME_PRICES: "crypto_prices"
+  DB_NAME_TRANSACTIONS: "crypto_transactions"
+  DB_NAME_NEWS: "crypto_news"
+  
+  # Connection Settings
+  DB_CONNECTION_TIMEOUT: "10"
+  DB_POOL_SIZE: "5"
+  DB_AUTOCOMMIT: "true"
+  DB_CHARSET: "utf8mb4"
+  DB_COLLATION: "utf8mb4_unicode_ci"
+  DB_TIMEZONE: "+00:00"
+  
+  # Legacy compatibility (for services still using these names)
+  MYSQL_HOST: "172.22.32.1"  # <-- SAME AS DB_HOST
+  MYSQL_PORT: "3306"
+  MYSQL_USER: "news_collector"
+  MYSQL_DATABASE: "crypto_prices"
+  MYSQL_DATABASE_TRANSACTIONS: "crypto_transactions"
+  MYSQL_DATABASE_PRICES: "crypto_prices"
+  
+  # Environment-specific overrides
+  DATABASE_HOST: "172.22.32.1"  # <-- SAME AS DB_HOST
+  DATABASE_PORT: "3306"
+  DATABASE_USER: "news_collector"
+  DATABASE_PASSWORD: "99Rules!"  # This will be moved to Secret
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-secrets
+  namespace: crypto-trading
+  labels:
+    app: crypto-trading-system
+    component: database-secrets
+type: Opaque
+data:
+  # Base64 encoded password
+  DB_PASSWORD: "OTlSdWxlcyE="  # "99Rules!" in base64
+  MYSQL_PASSWORD: "OTlSdWxlcyE="  # "99Rules!" in base64
+  DATABASE_PASSWORD: "OTlSdWxlcyE="  # "99Rules!" in base64

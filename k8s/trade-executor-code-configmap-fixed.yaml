@@ -1,0 +1,304 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trade-executor-code
+  namespace: crypto-trading
+  labels:
+    app: trade-executor-real
+    component: trade-execution
+data:
+  trade_executor_service.py: |
+    import os
+    import time
+    import json
+    import uuid
+    import mysql.connector
+    from coinbase.rest import RESTClient
+    from fastapi import FastAPI, HTTPException, Response
+    import uvicorn
+    import logging
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest
+    
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
+    # Prometheus metrics
+    trade_executions = Counter('trade_executions_total', 'Total trade executions', ['status', 'symbol'])
+    trade_execution_time = Histogram('trade_execution_time_seconds', 'Trade execution latency')
+    coinbase_api_time = Histogram('coinbase_api_time_seconds', 'Coinbase API response time')
+    order_precision_errors = Counter('order_precision_errors_total', 'Order precision errors')
+    
+    app = FastAPI(title='Trade Executor Real', version='1.0.0')
+    
+    def get_coinbase_client():
+        """Initialize Coinbase REST client"""
+        try:
+            api_key = os.getenv('COINBASE_API_KEY')
+            private_key = os.getenv('COINBASE_PRIVATE_KEY')
+            
+            if not api_key or not private_key:
+                logger.error('Missing Coinbase API credentials')
+                return None
+            
+            # Initialize the REST client
+            client = RESTClient(api_key=api_key, api_secret=private_key)
+            logger.info('Coinbase REST client initialized successfully')
+            return client
+            
+        except Exception as e:
+            logger.error(f'Failed to initialize Coinbase client: {e}')
+            return None
+    
+    def get_db_connection():
+        """Get database connection"""
+        try:
+            return mysql.connector.connect(
+                host=os.getenv('DB_HOST'),
+                user=os.getenv('DB_USER'),
+                password=os.getenv('DB_PASSWORD'),
+                database=os.getenv('DB_NAME_PRICES')
+            )
+        except Exception as e:
+            logger.error(f'Database connection error: {e}')
+            return None
+    
+    def execute_coinbase_trade(symbol, side, amount_usd):
+        """Execute trade using Coinbase SDK"""
+        try:
+            client = get_coinbase_client()
+            if not client:
+                return {"success": False, "error": "Failed to initialize Coinbase client"}
+            
+            # Generate unique client order ID
+            client_order_id = f'trade-{uuid.uuid4().hex[:8]}'
+            
+            # Convert symbol to Coinbase product ID format
+            product_id = f"{symbol}-USD"
+            
+            logger.info(f"Executing {side} order for {amount_usd} USD of {symbol}")
+            
+            if side.upper() == "BUY":
+                # Market buy order
+                order_result = client.market_order_buy(
+                    product_id=product_id,
+                    quote_size=f"{amount_usd:.2f}",
+                    client_order_id=client_order_id
+                )
+            else:
+                # Market sell order - need to get current balance first
+                accounts = client.get_accounts()
+                account = None
+                
+                # Debug: Log available account symbols
+                available_symbols = [acc.currency for acc in accounts.accounts]
+                logger.info(f"Available account symbols: {available_symbols}")
+                logger.info(f"Looking for symbol: {symbol}")
+                
+                # Try exact match first
+                for acc in accounts.accounts:
+                    if acc.currency == symbol:
+                        account = acc
+                        break
+                
+                # If no exact match, try case-insensitive match
+                if not account:
+                    for acc in accounts.accounts:
+                        if acc.currency.upper() == symbol.upper():
+                            account = acc
+                            logger.info(f"Found case-insensitive match: {acc.currency} for {symbol}")
+                            break
+                
+                # If still no match, try common variations
+                if not account:
+                    symbol_variations = [
+                        symbol.upper(),
+                        symbol.lower(),
+                        symbol.replace('-USD', ''),
+                        symbol.replace('-USD', '').upper(),
+                        symbol.replace('-USD', '').lower()
+                    ]
+                    
+                    for variation in symbol_variations:
+                        for acc in accounts.accounts:
+                            if acc.currency.upper() == variation.upper():
+                                account = acc
+                                logger.info(f"Found variation match: {acc.currency} for {symbol} (tried {variation})")
+                                break
+                        if account:
+                            break
+                
+                if not account:
+                    return {"success": False, "error": f"No {symbol} account found. Available symbols: {available_symbols[:10]}"}
+                
+                # Get available balance
+                try:
+                    if hasattr(account.available_balance, 'value'):
+                        available_balance = float(account.available_balance.value)
+                    elif isinstance(account.available_balance, dict):
+                        # If it's a dict, try to get the value
+                        available_balance = float(account.available_balance.get('value', 0))
+                    else:
+                        available_balance = float(account.available_balance)
+                except (ValueError, TypeError) as e:
+                    logger.error(f"Error parsing balance for {symbol}: {e}, balance type: {type(account.available_balance)}")
+                    return {"success": False, "error": f"Error parsing {symbol} balance"}
+                
+                if available_balance <= 0:
+                    return {"success": False, "error": f"Insufficient {symbol} balance"}
+                
+                # For sell orders, we need to specify base_size (crypto amount)
+                # Sell a small percentage of available balance
+                sell_percentage = 0.1  # Sell 10% of available balance
+                base_size = available_balance * sell_percentage
+                
+                if base_size <= 0:
+                    return {"success": False, "error": f"Insufficient {symbol} balance to sell"}
+                
+                # Round to appropriate precision based on symbol
+                # Use more conservative precision to avoid Coinbase errors
+                if symbol in ['BTC', 'ETH']:
+                    precision = 6
+                elif symbol in ['USDC', 'USDT']:
+                    precision = 2
+                elif symbol in ['ATOM', 'DOT', 'LINK', 'ADA']:
+                    precision = 4  # These seem to need fewer decimals
+                else:
+                    precision = 4  # Conservative default for most altcoins
+                
+                # Ensure we don't have too many decimals
+                base_size_rounded = round(base_size, precision)
+                
+                # If the rounded amount is too small, try a larger percentage
+                if base_size_rounded <= 0:
+                    sell_percentage = 0.5  # Try 50%
+                    base_size = available_balance * sell_percentage
+                    base_size_rounded = round(base_size, precision)
+                
+                if base_size_rounded <= 0:
+                    return {"success": False, "error": f"Insufficient {symbol} balance to sell (balance: {available_balance})"}
+                
+                logger.info(f"Selling {symbol}: {base_size_rounded} (from {available_balance} available)")
+                
+                order_result = client.market_order_sell(
+                    product_id=product_id,
+                    base_size=f"{base_size_rounded:.{precision}f}",
+                    client_order_id=client_order_id
+                )
+            
+            # Extract order information
+            if order_result.success:
+                # Successful order
+                order_info = order_result.success_response if hasattr(order_result, 'success_response') else {}
+                order_id = order_info.get('order_id', 'Unknown')
+                status = order_info.get('status', 'Unknown')
+                
+                logger.info(f"Trade executed successfully: Order ID {order_id}")
+                return {
+                    "success": True,
+                    "order_id": order_id,
+                    "client_order_id": client_order_id,
+                    "product_id": product_id,
+                    "side": side,
+                    "amount_usd": amount_usd,
+                    "status": status
+                }
+            else:
+                # Failed order
+                error_info = order_result.error_response if hasattr(order_result, 'error_response') else {}
+                error_message = error_info.get('message', 'Unknown error')
+                error_type = error_info.get('error', 'Unknown')
+                
+                logger.error(f"Trade failed: {error_type} - {error_message}")
+                return {
+                    "success": False,
+                    "error": f"{error_type}: {error_message}",
+                    "error_details": error_info
+                }
+                
+        except Exception as e:
+            logger.error(f"Trade execution error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    @app.get("/health")
+    async def health_check():
+        """Health check endpoint"""
+        try:
+            # Test Coinbase connection
+            client = get_coinbase_client()
+            if client:
+                # Test API connection
+                accounts = client.get_accounts()
+                return {
+                    "status": "healthy",
+                    "api_connected": True,
+                    "accounts_count": len(accounts.accounts) if hasattr(accounts, 'accounts') else 0
+                }
+            else:
+                return {"status": "unhealthy", "api_connected": False}
+        except Exception as e:
+            return {"status": "unhealthy", "error": str(e)}
+    
+    @app.get("/portfolio")
+    async def get_portfolio():
+        """Get portfolio information"""
+        try:
+            client = get_coinbase_client()
+            if not client:
+                raise HTTPException(status_code=500, detail="Failed to initialize Coinbase client")
+            
+            accounts = client.get_accounts()
+            portfolio = []
+            
+            for account in accounts.accounts:
+                if float(account.available_balance.value) > 0:
+                    portfolio.append({
+                        "currency": account.currency,
+                        "balance": account.available_balance.value,
+                        "hold": account.hold.value if hasattr(account, 'hold') else "0"
+                    })
+            
+            return {"portfolio": portfolio}
+            
+        except Exception as e:
+            logger.error(f"Portfolio error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/execute-trade")
+    async def execute_trade(trade_request: dict):
+        """Execute a trade"""
+        try:
+            symbol = trade_request.get("symbol", "").upper()
+            side = trade_request.get("side", "").upper()
+            amount_usd = float(trade_request.get("amount_usd", 0))
+            
+            if not symbol or not side or amount_usd <= 0:
+                raise HTTPException(status_code=400, detail="Invalid trade parameters")
+            
+            if side not in ["BUY", "SELL"]:
+                raise HTTPException(status_code=400, detail="Side must be BUY or SELL")
+            
+            # Execute the trade
+            result = execute_coinbase_trade(symbol, side, amount_usd)
+            
+            # Update metrics
+            trade_executions.labels(
+                status="success" if result["success"] else "error",
+                symbol=symbol
+            ).inc()
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Trade execution error: {e}")
+            trade_executions.labels(status="error", symbol="unknown").inc()
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/metrics")
+    async def metrics():
+        """Prometheus metrics endpoint"""
+        return Response(generate_latest(), media_type="text/plain")
+    
+    if __name__ == "__main__":
+        logger.info("🚀 Starting Trade Executor Real")
+        uvicorn.run(app, host="0.0.0.0", port=8024)

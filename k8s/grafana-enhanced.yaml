@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: crypto-trading
+  labels:
+    app: grafana
+    component: monitoring
+    node-type: analytics-monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+        component: monitoring
+        node-type: analytics-monitoring
+    spec:
+      nodeSelector:
+        node-name: cryptoai-analytics-monitoring
+      containers:
+      - name: grafana
+        image: grafana/grafana:latest
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: GF_SECURITY_ADMIN_USER
+          value: admin
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: admin123
+        - name: GF_INSTALL_PLUGINS
+          value: ""
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        volumeMounts:
+        - name: grafana-storage
+          mountPath: /var/lib/grafana
+        - name: grafana-datasources
+          mountPath: /etc/grafana/provisioning/datasources
+        - name: grafana-dashboard-provisioning
+          mountPath: /etc/grafana/provisioning/dashboards
+        - name: grafana-dashboard-crypto-trading-engine
+          mountPath: /var/lib/grafana/dashboards/crypto-trading-engine.json
+          subPath: crypto-trading-engine.json
+        - name: grafana-dashboard-unified-system
+          mountPath: /var/lib/grafana/dashboards/unified-system.json
+          subPath: unified-system.json
+      volumes:
+      - name: grafana-storage
+        emptyDir: {}
+      - name: grafana-datasources
+        configMap:
+          name: grafana-datasources
+      - name: grafana-dashboard-provisioning
+        configMap:
+          name: grafana-dashboard-provisioning
+      - name: grafana-dashboard-crypto-trading-engine
+        configMap:
+          name: grafana-dashboard-crypto-trading-engine
+      - name: grafana-dashboard-unified-system
+        configMap:
+          name: grafana-dashboard-unified-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: crypto-trading
+  labels:
+    app: grafana
+spec:
+  type: ClusterIP
+  ports:
+  - port: 3000
+    targetPort: 3000
+  selector:
+    app: grafana

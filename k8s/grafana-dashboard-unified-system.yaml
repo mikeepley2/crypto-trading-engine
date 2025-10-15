@@ -1,0 +1,298 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-unified-system
+  namespace: crypto-trading
+  labels:
+    grafana_dashboard: "1"
+data:
+  unified-system.json: |
+    {
+      "id": null,
+      "title": "Unified Crypto System - Complete Monitoring",
+      "tags": ["crypto", "unified", "system", "monitoring", "all-namespaces"],
+      "style": "dark",
+      "timezone": "browser",
+      "editable": true,
+      "graphTooltip": 0,
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "timepicker": {},
+      "refresh": "30s",
+      "schemaVersion": 30,
+      "version": 1,
+      "panels": [
+        {
+          "id": 1,
+          "title": "Cross-System Health Overview",
+          "type": "row",
+          "collapsed": false,
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 0
+          }
+        },
+        {
+          "id": 2,
+          "title": "All Namespaces Health Status",
+          "type": "stat",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "up{kubernetes_namespace=~\"crypto-.*\"}",
+              "refId": "A",
+              "legendFormat": "{{kubernetes_namespace}} - {{kubernetes_service_name}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [
+                {
+                  "options": {
+                    "0": {
+                      "color": "red",
+                      "index": 0,
+                      "text": "DOWN"
+                    },
+                    "1": {
+                      "color": "green",
+                      "index": 1,
+                      "text": "UP"
+                    }
+                  },
+                  "type": "value"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 1
+                  }
+                ]
+              },
+              "unit": "short"
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 1
+          },
+          "options": {
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "values": false,
+              "calcs": ["lastNotNull"],
+              "fields": ""
+            },
+            "textMode": "auto"
+          }
+        },
+        {
+          "id": 3,
+          "title": "Total Active Services",
+          "type": "stat",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "count(up{kubernetes_namespace=~\"crypto-.*\"} == 1)",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "unit": "short"
+            }
+          },
+          "gridPos": {
+            "h": 4,
+            "w": 4,
+            "x": 8,
+            "y": 1
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "values": false,
+              "calcs": ["lastNotNull"],
+              "fields": ""
+            },
+            "textMode": "auto"
+          }
+        },
+        {
+          "id": 4,
+          "title": "Overall System Status",
+          "type": "stat",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "count(up{kubernetes_namespace=~\"crypto-.*\"} == 0) == 0",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [
+                {
+                  "options": {
+                    "0": {
+                      "color": "red",
+                      "index": 0,
+                      "text": "DEGRADED"
+                    },
+                    "1": {
+                      "color": "green",
+                      "index": 1,
+                      "text": "HEALTHY"
+                    }
+                  },
+                  "type": "value"
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 1
+                  }
+                ]
+              },
+              "unit": "short"
+            }
+          },
+          "gridPos": {
+            "h": 4,
+            "w": 4,
+            "x": 12,
+            "y": 1
+          },
+          "options": {
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "values": false,
+              "calcs": ["lastNotNull"],
+              "fields": ""
+            },
+            "textMode": "auto"
+          }
+        },
+        {
+          "id": 5,
+          "title": "Services by Namespace",
+          "type": "stat",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "targets": [
+            {
+              "expr": "count by (kubernetes_namespace) (up{kubernetes_namespace=~\"crypto-.*\"} == 1)",
+              "refId": "A",
+              "legendFormat": "{{kubernetes_namespace}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              }
+            }
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 1
+          },
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "values": false,
+              "calcs": ["lastNotNull"],
+              "fields": ""
+            },
+            "textMode": "auto"
+          }
+        }
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "namespace",
+            "type": "query",
+            "query": "label_values(up{kubernetes_namespace=~\"crypto-.*\"}, kubernetes_namespace)",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus"
+            },
+            "refresh": 1,
+            "includeAll": true,
+            "multi": true,
+            "allValue": ".*"
+          }
+        ]
+      },
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": {
+              "type": "grafana",
+              "uid": "-- Grafana --"
+            },
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
+      }
+    }

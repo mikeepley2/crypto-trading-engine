@@ -1,0 +1,267 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trade-executor-code
+  namespace: crypto-trading
+  labels:
+    app: trade-executor-real
+    component: trade-execution
+data:
+  trade_executor_service.py: |
+    import os
+    import time
+    import json
+    import uuid
+    import mysql.connector
+    from coinbase.rest import RESTClient
+    from fastapi import FastAPI, HTTPException, Response
+    import uvicorn
+    import logging
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest
+    
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
+    # Prometheus metrics
+    trade_executions = Counter('trade_executions_total', 'Total trade executions', ['status', 'symbol'])
+    trade_execution_time = Histogram('trade_execution_time_seconds', 'Trade execution latency')
+    coinbase_api_time = Histogram('coinbase_api_time_seconds', 'Coinbase API response time')
+    order_precision_errors = Counter('order_precision_errors_total', 'Order precision errors')
+    
+    app = FastAPI(title='Trade Executor Real', version='1.0.0')
+    
+    def create_jwt_token():
+        """Create JWT token for Coinbase API authentication"""
+        try:
+            api_key = os.getenv('COINBASE_API_KEY')
+            private_key_pem = os.getenv('COINBASE_PRIVATE_KEY')
+            
+            if not api_key or not private_key_pem:
+                logger.error('Missing Coinbase API credentials')
+                return None
+            
+            # Parse the private key
+            private_key_obj = serialization.load_pem_private_key(
+                private_key_pem.encode(),
+                password=None
+            )
+            
+            # Create JWT payload
+            payload = {
+                'sub': api_key,
+                'iss': 'coinbase-cloud',
+                'nbf': int(time.time()),
+                'exp': int(time.time()) + 120,
+                'aud': ['retail_rest_api_proxy']
+            }
+            
+            headers = {
+                'kid': api_key,
+                'typ': 'JWT'
+            }
+            
+            # Create JWT token
+            token = jwt.encode(payload, private_key_obj, algorithm='ES256', headers=headers)
+            return token
+            
+        except Exception as e:
+            logger.error(f'Error creating JWT token: {e}')
+            return None
+    
+    def get_db_connection():
+        """Get database connection"""
+        try:
+            return mysql.connector.connect(
+                host=os.getenv('DB_HOST'),
+                user=os.getenv('DB_USER'),
+                password=os.getenv('DB_PASSWORD'),
+                database=os.getenv('DB_NAME_PRICES')
+            )
+        except Exception as e:
+            logger.error(f'Database connection error: {e}')
+            return None
+    
+    def get_crypto_balance(symbol):
+        """Get the available crypto balance for a symbol using official Coinbase SDK"""
+        try:
+            from coinbase.rest import RESTClient
+            
+            api_key = os.getenv('COINBASE_API_KEY')
+            private_key = os.getenv('COINBASE_PRIVATE_KEY')
+            
+            if not api_key or not private_key:
+                logger.warning('Missing Coinbase API credentials for balance check')
+                return 0.0
+            
+            # Create REST client
+            client = RESTClient(api_key=api_key, api_secret=private_key)
+            
+            # Get account information
+            accounts = client.get_accounts()
+            
+            # Find the account for the symbol
+            for account in accounts.accounts:
+                if account.currency == symbol:
+                    return float(account.available_balance.value)
+            
+            return 0.0
+            
+        except Exception as e:
+            logger.error(f'Error getting balance for {symbol}: {e}')
+            return 0.0
+    
+    def execute_trade(symbol, side, amount_usd, order_type='market_market_ioc'):
+        """Execute a trade using Coinbase Advanced Trade API"""
+        try:
+            token = create_jwt_token()
+            if not token:
+                return {'success': False, 'error': 'Failed to create JWT token'}
+            
+            # Prepare order data
+            if side.upper() == 'BUY':
+                order_data = {
+                    'product_id': f'{symbol}-USD',
+                    'order_configuration': {
+                        'market_market_ioc': {
+                            'quote_size': str(amount_usd)
+                        }
+                    },
+                    'side': 'BUY',
+                    'order_type': 'MARKET'
+                }
+            else:  # SELL
+                # For sell orders, we need to specify base_size (crypto amount)
+                # Get current balance first
+                balance = get_crypto_balance(symbol)
+                if balance <= 0:
+                    return {'success': False, 'error': f'Insufficient {symbol} balance: {balance}'}
+                
+                # Calculate base_size (crypto amount to sell)
+                base_size = min(balance * 0.95, amount_usd / 50000)  # Conservative estimate
+                
+                order_data = {
+                    'product_id': f'{symbol}-USD',
+                    'order_configuration': {
+                        'market_market_ioc': {
+                            'base_size': str(base_size)
+                        }
+                    },
+                    'side': 'SELL',
+                    'order_type': 'MARKET'
+                }
+            
+            # Make API call to Coinbase
+            headers = {
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json'
+            }
+            
+            response = requests.post(
+                'https://api.coinbase.com/api/v3/brokerage/orders',
+                headers=headers,
+                json=order_data,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f'✅ Trade executed successfully: {symbol} {side} ${amount_usd}')
+                trade_executions.labels(status='success', symbol=symbol).inc()
+                return {'success': True, 'order_id': result.get('order_id'), 'result': result}
+            else:
+                error_msg = f'Coinbase API error: {response.status_code} - {response.text}'
+                logger.error(error_msg)
+                trade_executions.labels(status='failed', symbol=symbol).inc()
+                return {'success': False, 'error': error_msg}
+                
+        except Exception as e:
+            error_msg = f'Trade execution error: {str(e)}'
+            logger.error(error_msg)
+            trade_executions.labels(status='error', symbol=symbol).inc()
+            return {'success': False, 'error': error_msg}
+    
+    @app.get('/health')
+    async def health_check():
+        """Health check endpoint"""
+        try:
+            # Test database connection
+            db_conn = get_db_connection()
+            if db_conn:
+                db_conn.close()
+                db_status = 'connected'
+            else:
+                db_status = 'disconnected'
+            
+            return {
+                'status': 'healthy',
+                'service': 'trade-executor-real',
+                'database': db_status,
+                'timestamp': time.time()
+            }
+        except Exception as e:
+            return {'status': 'unhealthy', 'error': str(e)}
+    
+    @app.get('/metrics')
+    async def metrics():
+        """Prometheus metrics endpoint"""
+        return Response(content=generate_latest(), media_type='text/plain')
+    
+    @app.post('/execute-trade')
+    async def execute_trade_endpoint(trade_data: dict):
+        """Execute a trade"""
+        try:
+            symbol = trade_data.get('symbol')
+            side = trade_data.get('side')
+            amount_usd = trade_data.get('amount_usd')
+            
+            if not all([symbol, side, amount_usd]):
+                raise HTTPException(status_code=400, detail='Missing required fields')
+            
+            result = execute_trade(symbol, side, amount_usd)
+            return result
+            
+        except Exception as e:
+            logger.error(f'Trade execution endpoint error: {e}')
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get('/portfolio')
+    async def get_portfolio():
+        """Get portfolio information"""
+        try:
+            from coinbase.rest import RESTClient
+            
+            api_key = os.getenv('COINBASE_API_KEY')
+            private_key = os.getenv('COINBASE_PRIVATE_KEY')
+            
+            if not api_key or not private_key:
+                return {'error': 'Missing API credentials'}
+            
+            client = RESTClient(api_key=api_key, api_secret=private_key)
+            accounts = client.get_accounts()
+            
+            portfolio = []
+            total_usd = 0.0
+            
+            for account in accounts.accounts:
+                if float(account.available_balance.value) > 0:
+                    portfolio.append({
+                        'symbol': account.currency,
+                        'balance': float(account.available_balance.value),
+                        'value_usd': float(account.available_balance.value) * 50000  # Rough estimate
+                    })
+                    total_usd += float(account.available_balance.value) * 50000
+            
+            return {
+                'portfolio': portfolio,
+                'total_value_usd': total_usd,
+                'timestamp': time.time()
+            }
+            
+        except Exception as e:
+            logger.error(f'Portfolio error: {e}')
+            return {'error': str(e)}
+    
+    if __name__ == '__main__':
+        logger.info('🚀 Starting Trade Executor Real')
+        uvicorn.run(app, host='0.0.0.0', port=8024)

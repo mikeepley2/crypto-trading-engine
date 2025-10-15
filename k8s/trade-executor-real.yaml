@@ -81,10 +81,10 @@ spec:
           
           def get_db_connection():
               return mysql.connector.connect(
-                  host=os.getenv('DB_HOST', '172.22.32.1'),
-                  user=os.getenv('DB_USER', 'news_collector'),
+                  host=os.getenv('DB_HOST'),
+                  user=os.getenv('DB_USER'),
                   password=os.getenv('DB_PASSWORD'),
-                  database='crypto_prices'
+                  database=os.getenv('DB_NAME_PRICES')
               )
           
           def get_crypto_balance(symbol):
