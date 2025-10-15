@@ -1,0 +1,569 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: risk-management-code
+  namespace: crypto-trading
+  labels:
+    app: risk-management-service
+    component: risk-management
+data:
+  risk_management_service.py: |
+    import os
+    import time
+    import json
+    import mysql.connector
+    import requests
+    import pandas as pd
+    import numpy as np
+    from datetime import datetime, timedelta
+    from fastapi import FastAPI, HTTPException
+    import uvicorn
+    import logging
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest
+    from typing import Dict, List, Optional, Tuple
+    from dataclasses import dataclass
+    
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
+    # Prometheus metrics
+    risk_checks_performed = Counter('risk_checks_performed_total', 'Total risk checks performed', ['check_type', 'result'])
+    risk_violations = Counter('risk_violations_total', 'Total risk violations detected', ['violation_type'])
+    portfolio_risk_score = Gauge('portfolio_risk_score', 'Current portfolio risk score (0-100)')
+    position_sizes = Gauge('position_sizes', 'Current position sizes', ['symbol'])
+    correlation_alerts = Counter('correlation_alerts_total', 'Total correlation alerts', ['alert_type'])
+    
+    app = FastAPI(title='Enhanced Risk Management Service')
+    
+    @dataclass
+    class RiskLimits:
+        max_daily_loss_percent: float = 5.0
+        max_trade_risk_percent: float = 1.0
+        max_open_trades: int = 10
+        max_position_size_percent: float = 20.0
+        max_correlation_threshold: float = 0.7
+        min_confidence_threshold: float = 0.6
+        max_volatility_threshold: float = 0.3
+    
+    @dataclass
+    class RiskAssessment:
+        overall_risk_score: float
+        risk_level: str  # low, medium, high, critical
+        violations: List[str]
+        recommendations: List[str]
+        approved: bool
+    
+    def get_db_connection():
+        try:
+            return mysql.connector.connect(
+                host=os.getenv('DB_HOST'),
+                user=os.getenv('DB_USER'),
+                password=os.getenv('DB_PASSWORD'),
+                database=os.getenv('DB_NAME_PRICES')
+            )
+        except Exception as e:
+            logger.error(f'Database connection error: {e}')
+            return None
+    
+    def get_coinbase_client():
+        try:
+            from coinbase_advanced_py import RESTClient
+            return RESTClient(
+                api_key=os.getenv('COINBASE_API_KEY'),
+                api_secret=os.getenv('COINBASE_PRIVATE_KEY')
+            )
+        except Exception as e:
+            logger.error(f'Coinbase client error: {e}')
+            return None
+    
+    def get_current_portfolio():
+        """Get current portfolio positions and balances"""
+        try:
+            client = get_coinbase_client()
+            if not client:
+                return {}
+            
+            accounts = client.get_accounts()
+            portfolio = {}
+            
+            for account in accounts.accounts:
+                try:
+                    if hasattr(account.available_balance, 'value'):
+                        balance = float(account.available_balance.value)
+                    elif isinstance(account.available_balance, dict):
+                        balance = float(account.available_balance.get('value', 0))
+                    else:
+                        balance = float(account.available_balance)
+                    
+                    if balance > 0:
+                        portfolio[account.currency] = balance
+                except (ValueError, TypeError):
+                    continue
+            
+            return portfolio
+        except Exception as e:
+            logger.error(f'Error getting portfolio: {e}')
+            return {}
+    
+    def calculate_portfolio_risk_score(portfolio: Dict[str, float]) -> float:
+        """Calculate overall portfolio risk score (0-100)"""
+        try:
+            if not portfolio:
+                return 0.0
+            
+            # Get recent price data for risk calculation
+            conn = get_db_connection()
+            if not conn:
+                return 50.0  # Default medium risk if no data
+            
+            cursor = conn.cursor()
+            
+            # Calculate volatility-based risk
+            volatility_risk = 0.0
+            position_concentration_risk = 0.0
+            
+            total_value = sum(portfolio.values())
+            if total_value == 0:
+                return 0.0
+            
+            for symbol, balance in portfolio.items():
+                # Position concentration risk (larger positions = higher risk)
+                position_percent = (balance / total_value) * 100
+                if position_percent > 20:  # More than 20% in one position
+                    position_concentration_risk += (position_percent - 20) * 2
+                
+                # Get recent volatility for this symbol
+                cursor.execute('''
+                    SELECT price, timestamp 
+                    FROM crypto_prices 
+                    WHERE symbol = %s 
+                    AND timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                    ORDER BY timestamp DESC 
+                    LIMIT 100
+                ''', (symbol,))
+                
+                prices = cursor.fetchall()
+                if len(prices) > 10:
+                    price_series = [float(p[0]) for p in prices]
+                    volatility = np.std(price_series) / np.mean(price_series)
+                    volatility_risk += volatility * 50  # Scale volatility to risk score
+            
+            cursor.close()
+            conn.close()
+            
+            # Combine risk factors
+            total_risk = min(100.0, volatility_risk + position_concentration_risk)
+            return total_risk
+            
+        except Exception as e:
+            logger.error(f'Error calculating portfolio risk: {e}')
+            return 50.0  # Default medium risk
+    
+    def check_position_sizing(recommendation: Dict, portfolio: Dict[str, float]) -> Tuple[bool, str]:
+        """Check if position size is within risk limits"""
+        try:
+            symbol = recommendation['symbol']
+            amount_usd = float(recommendation['amount_usd'])
+            
+            # Calculate total portfolio value
+            total_value = sum(portfolio.values())
+            if total_value == 0:
+                return False, "No portfolio value available"
+            
+            # Check position size limit (max 20% of portfolio)
+            position_percent = (amount_usd / total_value) * 100
+            if position_percent > 20.0:
+                return False, f"Position size {position_percent:.1f}% exceeds 20% limit"
+            
+            # Check if we have enough balance for the trade
+            if recommendation['signal_type'] == 'SELL':
+                if symbol not in portfolio or portfolio[symbol] <= 0:
+                    return False, f"Insufficient {symbol} balance for sell order"
+            
+            return True, "Position size within limits"
+            
+        except Exception as e:
+            logger.error(f'Error checking position sizing: {e}')
+            return False, f"Position sizing check failed: {str(e)}"
+    
+    def check_daily_loss_limits() -> Tuple[bool, str]:
+        """Check if daily loss limits are within bounds"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return True, "No database connection for loss check"
+            
+            cursor = conn.cursor()
+            
+            # Get today's executed trades
+            cursor.execute('''
+                SELECT symbol, signal_type, amount_usd, execution_status
+                FROM trade_recommendations 
+                WHERE DATE(executed_at) = CURDATE()
+                AND execution_status = 'EXECUTED'
+            ''')
+            
+            trades = cursor.fetchall()
+            
+            # Calculate daily P&L (simplified - would need actual trade results)
+            daily_pnl = 0.0
+            for trade in trades:
+                symbol, signal_type, amount_usd, status = trade
+                # Simplified P&L calculation (would need actual trade results)
+                if signal_type == 'SELL':
+                    daily_pnl += amount_usd * 0.02  # Assume 2% profit on sells
+                else:
+                    daily_pnl -= amount_usd * 0.01  # Assume 1% loss on buys
+            
+            # Check against daily loss limit (5%)
+            if daily_pnl < -500:  # $500 daily loss limit
+                return False, f"Daily loss limit exceeded: ${daily_pnl:.2f}"
+            
+            cursor.close()
+            conn.close()
+            
+            return True, f"Daily loss within limits: ${daily_pnl:.2f}"
+            
+        except Exception as e:
+            logger.error(f'Error checking daily loss limits: {e}')
+            return True, "Daily loss check failed"
+    
+    def check_correlation_risk(recommendation: Dict) -> Tuple[bool, str]:
+        """Check for correlation risk with existing positions"""
+        try:
+            symbol = recommendation['symbol']
+            portfolio = get_current_portfolio()
+            
+            if len(portfolio) < 2:
+                return True, "Insufficient positions for correlation check"
+            
+            # Simplified correlation check (would need actual correlation data)
+            # For now, just check if we're over-concentrated in similar assets
+            crypto_assets = [s for s in portfolio.keys() if s not in ['USD', 'USDC', 'USDT']]
+            
+            if len(crypto_assets) > 5:  # Too many crypto positions
+                return False, f"Too many crypto positions ({len(crypto_assets)}), correlation risk high"
+            
+            return True, "Correlation risk within limits"
+            
+        except Exception as e:
+            logger.error(f'Error checking correlation risk: {e}')
+            return True, "Correlation check failed"
+    
+    def perform_comprehensive_risk_assessment(recommendation: Dict) -> RiskAssessment:
+        """Perform comprehensive risk assessment for a trade recommendation"""
+        try:
+            violations = []
+            recommendations = []
+            
+            # Get current portfolio
+            portfolio = get_current_portfolio()
+            
+            # Check position sizing
+            sizing_ok, sizing_msg = check_position_sizing(recommendation, portfolio)
+            if not sizing_ok:
+                violations.append(f"Position sizing: {sizing_msg}")
+            else:
+                recommendations.append("Position sizing: OK")
+            
+            # Check daily loss limits
+            loss_ok, loss_msg = check_daily_loss_limits()
+            if not loss_ok:
+                violations.append(f"Daily loss: {loss_msg}")
+            else:
+                recommendations.append(f"Daily loss: {loss_msg}")
+            
+            # Check correlation risk
+            corr_ok, corr_msg = check_correlation_risk(recommendation)
+            if not corr_ok:
+                violations.append(f"Correlation: {corr_msg}")
+            else:
+                recommendations.append(f"Correlation: {corr_msg}")
+            
+            # Check confidence threshold
+            confidence = float(recommendation.get('confidence', 0))
+            if confidence < 0.6:
+                violations.append(f"Low confidence: {confidence:.2f} < 0.6")
+            else:
+                recommendations.append(f"Confidence: {confidence:.2f} (OK)")
+            
+            # Calculate overall risk score
+            portfolio_risk = calculate_portfolio_risk_score(portfolio)
+            risk_score = portfolio_risk + (len(violations) * 20)  # Add 20 points per violation
+            
+            # Determine risk level
+            if risk_score < 30:
+                risk_level = "low"
+            elif risk_score < 60:
+                risk_level = "medium"
+            elif risk_score < 80:
+                risk_level = "high"
+            else:
+                risk_level = "critical"
+            
+            # Determine if trade is approved
+            approved = len(violations) == 0 and risk_score < 70
+            
+            return RiskAssessment(
+                overall_risk_score=risk_score,
+                risk_level=risk_level,
+                violations=violations,
+                recommendations=recommendations,
+                approved=approved
+            )
+            
+        except Exception as e:
+            logger.error(f'Error in risk assessment: {e}')
+            return RiskAssessment(
+                overall_risk_score=100.0,
+                risk_level="critical",
+                violations=[f"Risk assessment failed: {str(e)}"],
+                recommendations=["Manual review required"],
+                approved=False
+            )
+    
+    def process_pending_recommendations():
+        """Process pending trade recommendations for risk assessment"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return
+            
+            cursor = conn.cursor()
+            
+            # Get pending recommendations that need risk assessment
+            cursor.execute('''
+                SELECT id, symbol, signal_type, amount_usd, confidence, reasoning
+                FROM trade_recommendations 
+                WHERE execution_status = 'PENDING'
+                AND risk_assessment IS NULL
+                AND created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                ORDER BY created_at ASC
+                LIMIT 5
+            ''')
+            
+            recommendations = cursor.fetchall()
+            
+            for rec in recommendations:
+                recommendation = {
+                    'id': rec[0],
+                    'symbol': rec[1],
+                    'signal_type': rec[2],
+                    'amount_usd': rec[3],
+                    'confidence': rec[4],
+                    'reasoning': rec[5]
+                }
+                
+                # Perform risk assessment
+                risk_assessment = perform_comprehensive_risk_assessment(recommendation)
+                
+                # Update recommendation with risk assessment
+                cursor.execute('''
+                    UPDATE trade_recommendations 
+                    SET risk_assessment = %s,
+                        risk_score = %s,
+                        risk_level = %s,
+                        risk_violations = %s,
+                        risk_recommendations = %s,
+                        risk_approved = %s,
+                        risk_timestamp = NOW()
+                    WHERE id = %s
+                ''', (
+                    json.dumps({
+                        'overall_risk_score': risk_assessment.overall_risk_score,
+                        'risk_level': risk_assessment.risk_level,
+                        'violations': risk_assessment.violations,
+                        'recommendations': risk_assessment.recommendations
+                    }),
+                    risk_assessment.overall_risk_score,
+                    risk_assessment.risk_level,
+                    json.dumps(risk_assessment.violations),
+                    json.dumps(risk_assessment.recommendations),
+                    risk_assessment.approved,
+                    recommendation['id']
+                ))
+                
+                logger.info(f'Risk assessment completed for recommendation {rec[0]}: {risk_assessment.risk_level} risk, approved: {risk_assessment.approved}')
+                
+                # Update metrics
+                risk_checks_performed.labels(
+                    check_type='comprehensive',
+                    result='approved' if risk_assessment.approved else 'rejected'
+                ).inc()
+                
+                for violation in risk_assessment.violations:
+                    risk_violations.labels(violation_type=violation.split(':')[0]).inc()
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f'Error processing recommendations: {e}')
+    
+    def risk_monitoring_loop():
+        """Main risk monitoring loop"""
+        while True:
+            try:
+                logger.info('Running risk monitoring cycle...')
+                
+                # Update portfolio risk score
+                portfolio = get_current_portfolio()
+                risk_score = calculate_portfolio_risk_score(portfolio)
+                portfolio_risk_score.set(risk_score)
+                
+                # Update position size metrics
+                for symbol, balance in portfolio.items():
+                    position_sizes.labels(symbol=symbol).set(balance)
+                
+                # Process pending recommendations
+                process_pending_recommendations()
+                
+                # Wait 30 seconds before next cycle
+                time.sleep(30)
+                
+            except Exception as e:
+                logger.error(f'Error in risk monitoring loop: {e}')
+                time.sleep(60)
+    
+    @app.get('/health')
+    async def health_check():
+        return {
+            'status': 'healthy',
+            'service': 'enhanced-risk-management',
+            'features': [
+                'position_sizing',
+                'daily_loss_limits',
+                'correlation_risk',
+                'confidence_thresholds',
+                'portfolio_risk_scoring'
+            ]
+        }
+    
+    @app.get('/metrics')
+    async def metrics():
+        return Response(content=generate_latest(), media_type='text/plain')
+    
+    @app.post('/assess-risk')
+    async def assess_risk_endpoint(recommendation: dict):
+        try:
+            risk_assessment = perform_comprehensive_risk_assessment(recommendation)
+            return {
+                'success': True,
+                'risk_assessment': {
+                    'overall_risk_score': risk_assessment.overall_risk_score,
+                    'risk_level': risk_assessment.risk_level,
+                    'violations': risk_assessment.violations,
+                    'recommendations': risk_assessment.recommendations,
+                    'approved': risk_assessment.approved
+                }
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get('/portfolio-risk')
+    async def get_portfolio_risk():
+        try:
+            portfolio = get_current_portfolio()
+            risk_score = calculate_portfolio_risk_score(portfolio)
+            
+            return {
+                'portfolio': portfolio,
+                'risk_score': risk_score,
+                'risk_level': 'low' if risk_score < 30 else 'medium' if risk_score < 60 else 'high' if risk_score < 80 else 'critical'
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    if __name__ == '__main__':
+        logger.info('🚀 Starting Enhanced Risk Management Service')
+        
+        # Start risk monitoring loop in background
+        import threading
+        risk_thread = threading.Thread(target=risk_monitoring_loop, daemon=True)
+        risk_thread.start()
+        
+        logger.info('✅ Enhanced risk management service ready')
+        uvicorn.run(app, host='0.0.0.0', port=8027)
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enhanced-risk-management
+  namespace: crypto-trading
+  labels:
+    app: enhanced-risk-management
+    component: risk-management
+    node-type: analytics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: enhanced-risk-management
+  template:
+    metadata:
+      labels:
+        app: enhanced-risk-management
+        component: risk-management
+        node-type: analytics
+    spec:
+      nodeSelector:
+        node-name: cryptoai-risk-analytics
+      tolerations:
+      - key: analytics-infrastructure
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      containers:
+      - name: enhanced-risk-management
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8027
+          name: http
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn requests mysql-connector-python pandas numpy scikit-learn prometheus_client coinbase-advanced-py
+          python /app/risk_management_service.py
+        envFrom:
+        - configMapRef:
+            name: crypto-trading-config
+        - configMapRef:
+            name: database-config
+        - secretRef:
+            name: database-secrets
+        - secretRef:
+            name: coinbase-api-secrets
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+      volumes:
+      - name: app-code
+        configMap:
+          name: risk-management-code
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: enhanced-risk-management
+  namespace: crypto-trading
+  labels:
+    app: enhanced-risk-management
+    component: risk-management
+spec:
+  selector:
+    app: enhanced-risk-management
+  ports:
+  - port: 8027
+    targetPort: 8027
+    protocol: TCP
+  type: ClusterIP

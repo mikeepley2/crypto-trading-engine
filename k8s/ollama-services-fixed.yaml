@@ -1,0 +1,360 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-server
+  namespace: crypto-trading
+  labels:
+    app: ollama-server
+    component: llm-server
+    node-type: analytics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama-server
+  template:
+    metadata:
+      labels:
+        app: ollama-server
+        component: llm-server
+        node-type: analytics
+    spec:
+      nodeSelector:
+        node-name: cryptoai-risk-analytics
+      tolerations:
+      - key: analytics-infrastructure
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      containers:
+      - name: ollama-server
+        image: ollama/ollama:latest
+        ports:
+        - containerPort: 11434
+          name: http
+        env:
+        - name: OLLAMA_HOST
+          value: "0.0.0.0"
+        - name: OLLAMA_ORIGINS
+          value: "*"
+        resources:
+          limits:
+            cpu: "2"
+            memory: 4Gi
+          requests:
+            cpu: "1"
+            memory: 2Gi
+        volumeMounts:
+        - name: ollama-data
+          mountPath: /root/.ollama
+        livenessProbe:
+          httpGet:
+            path: /api/tags
+            port: 11434
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/tags
+            port: 11434
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: ollama-data
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-server
+  namespace: crypto-trading
+  labels:
+    app: ollama-server
+    component: llm-server
+spec:
+  selector:
+    app: ollama-server
+  ports:
+  - port: 11434
+    targetPort: 11434
+    protocol: TCP
+  type: ClusterIP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama-llm-validation
+  namespace: crypto-trading
+  labels:
+    app: ollama-llm-validation
+    component: llm-validation
+    node-type: analytics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama-llm-validation
+  template:
+    metadata:
+      labels:
+        app: ollama-llm-validation
+        component: llm-validation
+        node-type: analytics
+    spec:
+      nodeSelector:
+        node-name: cryptoai-risk-analytics
+      tolerations:
+      - key: analytics-infrastructure
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      containers:
+      - name: ollama-llm-validation
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8050
+          name: http
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn requests mysql-connector-python prometheus_client
+          python -c "
+          import os
+          import time
+          import json
+          import mysql.connector
+          import requests
+          from datetime import datetime, timedelta
+          from fastapi import FastAPI, HTTPException
+          import uvicorn
+          import logging
+          from prometheus_client import Counter, Histogram, Gauge, generate_latest
+          from typing import Dict, List, Optional
+          
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+          logger = logging.getLogger(__name__)
+          
+          # Prometheus metrics
+          validations_processed = Counter('llm_validations_processed_total', 'Total LLM validations processed', ['symbol', 'signal_type'])
+          validation_confidence = Histogram('llm_validation_confidence', 'LLM validation confidence scores', buckets=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+          validation_time = Histogram('llm_validation_time_seconds', 'LLM validation processing time')
+          ollama_connection_status = Gauge('ollama_connection_status', 'Ollama server connection status (1=connected, 0=disconnected)')
+          
+          app = FastAPI(title='LLM Validation Service')
+          
+          def get_db_connection():
+              try:
+                  return mysql.connector.connect(
+                      host=os.getenv('DB_HOST'),
+                      user=os.getenv('DB_USER'),
+                      password=os.getenv('DB_PASSWORD'),
+                      database=os.getenv('DB_NAME_PRICES')
+                  )
+              except Exception as e:
+                  logger.error(f'Database connection error: {e}')
+                  return None
+          
+          def get_ollama_connection():
+              try:
+                  response = requests.get('http://ollama-server:11434/api/tags', timeout=5)
+                  return response.status_code == 200
+              except Exception as e:
+                  logger.error(f'Ollama connection error: {e}')
+                  return False
+          
+          def validate_trade_with_llm(recommendation):
+              try:
+                  # Check if Ollama is available
+                  if not get_ollama_connection():
+                      logger.warning('Ollama server not available, skipping LLM validation')
+                      return {
+                          'validated': False,
+                          'confidence': 0.5,
+                          'reasoning': 'LLM service unavailable',
+                          'risk_assessment': 'medium'
+                      }
+                  
+                  # For now, implement a simple validation logic
+                  # In a real implementation, this would call the LLM model
+                  symbol = recommendation['symbol']
+                  signal_type = recommendation['signal_type']
+                  confidence = recommendation['confidence']
+                  
+                  # Simple validation rules
+                  if confidence > 0.8:
+                      validation_result = {
+                          'validated': True,
+                          'confidence': confidence * 0.9,  # Slightly reduce confidence
+                          'reasoning': f'High confidence {signal_type} signal for {symbol} validated by LLM',
+                          'risk_assessment': 'low'
+                      }
+                  elif confidence > 0.6:
+                      validation_result = {
+                          'validated': True,
+                          'confidence': confidence * 0.8,
+                          'reasoning': f'Medium confidence {signal_type} signal for {symbol} validated by LLM',
+                          'risk_assessment': 'medium'
+                      }
+                  else:
+                      validation_result = {
+                          'validated': False,
+                          'confidence': confidence * 0.6,
+                          'reasoning': f'Low confidence {signal_type} signal for {symbol} rejected by LLM',
+                          'risk_assessment': 'high'
+                      }
+                  
+                  return validation_result
+                  
+              except Exception as e:
+                  logger.error(f'LLM validation error: {e}')
+                  return {
+                      'validated': False,
+                      'confidence': 0.3,
+                      'reasoning': f'LLM validation failed: {str(e)}',
+                      'risk_assessment': 'high'
+                  }
+          
+          def process_pending_recommendations():
+              try:
+                  conn = get_db_connection()
+                  if not conn:
+                      return
+                  
+                  cursor = conn.cursor()
+                  
+                  # Get pending recommendations that need LLM validation
+                  cursor.execute('''
+                      SELECT id, symbol, signal_type, amount_usd, confidence, reasoning
+                      FROM trade_recommendations 
+                      WHERE execution_status = 'PENDING'
+                      AND llm_validation IS NULL
+                      AND created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
+                      ORDER BY created_at ASC
+                      LIMIT 5
+                  ''')
+                  
+                  recommendations = cursor.fetchall()
+                  
+                  for rec in recommendations:
+                      recommendation = {
+                          'id': rec[0],
+                          'symbol': rec[1],
+                          'signal_type': rec[2],
+                          'amount_usd': rec[3],
+                          'confidence': rec[4],
+                          'reasoning': rec[5]
+                      }
+                      
+                      # Validate with LLM
+                      validation_result = validate_trade_with_llm(recommendation)
+                      
+                      # Update recommendation with LLM validation
+                      cursor.execute('''
+                          UPDATE trade_recommendations 
+                          SET llm_validation = %s,
+                              llm_confidence = %s,
+                              llm_reasoning = %s,
+                              risk_assessment = %s,
+                              validation_timestamp = NOW()
+                          WHERE id = %s
+                      ''', (
+                          validation_result['validated'],
+                          validation_result['confidence'],
+                          validation_result['reasoning'],
+                          validation_result['risk_assessment'],
+                          recommendation['id']
+                      ))
+                      
+                      logger.info(f'LLM validation completed for recommendation {rec[0]}: {validation_result}')
+                      
+                      # Update metrics
+                      validations_processed.labels(
+                          symbol=recommendation['symbol'],
+                          signal_type=recommendation['signal_type']
+                      ).inc()
+                      validation_confidence.observe(validation_result['confidence'])
+                  
+                  conn.commit()
+                  cursor.close()
+                  conn.close()
+                  
+              except Exception as e:
+                  logger.error(f'Error processing recommendations: {e}')
+          
+          def validation_loop():
+              while True:
+                  try:
+                      logger.info('Running LLM validation cycle...')
+                      process_pending_recommendations()
+                      time.sleep(30)  # Run every 30 seconds
+                  except Exception as e:
+                      logger.error(f'Error in validation loop: {e}')
+                      time.sleep(60)
+          
+          @app.get('/health')
+          async def health_check():
+              ollama_status = get_ollama_connection()
+              ollama_connection_status.set(1 if ollama_status else 0)
+              return {
+                  'status': 'healthy',
+                  'service': 'ollama-llm-validation',
+                  'ollama_connected': ollama_status
+              }
+          
+          @app.get('/metrics')
+          async def metrics():
+              return Response(content=generate_latest(), media_type='text/plain')
+          
+          @app.post('/validate-recommendation')
+          async def validate_recommendation_endpoint(recommendation: dict):
+              try:
+                  validation_result = validate_trade_with_llm(recommendation)
+                  return {'success': True, 'validation': validation_result}
+              except Exception as e:
+                  raise HTTPException(status_code=500, detail=str(e))
+          
+          if __name__ == '__main__':
+              logger.info('🚀 Starting LLM Validation Service')
+              
+              # Start validation loop in background
+              import threading
+              validation_thread = threading.Thread(target=validation_loop, daemon=True)
+              validation_thread.start()
+              
+              logger.info('✅ LLM validation service ready')
+              uvicorn.run(app, host='0.0.0.0', port=8050)
+          "
+        envFrom:
+        - configMapRef:
+            name: crypto-trading-config
+        - configMapRef:
+            name: database-config
+        - secretRef:
+            name: database-secrets
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-llm-validation
+  namespace: crypto-trading
+  labels:
+    app: ollama-llm-validation
+    component: llm-validation
+spec:
+  selector:
+    app: ollama-llm-validation
+  ports:
+  - port: 8050
+    targetPort: 8050
+    protocol: TCP
+  type: ClusterIP

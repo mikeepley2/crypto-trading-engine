@@ -1,0 +1,636 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trading-strategies-code
+  namespace: crypto-trading
+  labels:
+    app: trading-strategies-service
+    component: trading-strategies
+data:
+  trading_strategies_service.py: |
+    import os
+    import time
+    import json
+    import mysql.connector
+    import requests
+    import pandas as pd
+    import numpy as np
+    from datetime import datetime, timedelta
+    from fastapi import FastAPI, HTTPException
+    import uvicorn
+    import logging
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest
+    from typing import Dict, List, Optional, Tuple
+    from dataclasses import dataclass
+    from enum import Enum
+    
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
+    # Prometheus metrics
+    strategy_signals_generated = Counter('strategy_signals_generated_total', 'Total strategy signals generated', ['strategy', 'signal_type'])
+    strategy_performance = Histogram('strategy_performance', 'Strategy performance metrics', ['strategy'])
+    market_regime_detected = Gauge('market_regime_detected', 'Current market regime (0=bear, 1=sideways, 2=bull)')
+    momentum_signals = Counter('momentum_signals_total', 'Momentum strategy signals', ['direction'])
+    mean_reversion_signals = Counter('mean_reversion_signals_total', 'Mean reversion strategy signals', ['direction'])
+    
+    app = FastAPI(title='Trading Strategies Service')
+    
+    class MarketRegime(Enum):
+        BEAR = "bear"
+        SIDEWAYS = "sideways"
+        BULL = "bull"
+    
+    class StrategyType(Enum):
+        MOMENTUM = "momentum"
+        MEAN_REVERSION = "mean_reversion"
+        BREAKOUT = "breakout"
+        SCALPING = "scalping"
+        SWING = "swing"
+        ARBITRAGE = "arbitrage"
+    
+    @dataclass
+    class TradingSignal:
+        symbol: str
+        signal_type: str  # BUY, SELL, HOLD
+        confidence: float
+        strategy: str
+        reasoning: str
+        entry_price: Optional[float] = None
+        stop_loss: Optional[float] = None
+        take_profit: Optional[float] = None
+        time_horizon: str = "short"  # short, medium, long
+    
+    def get_db_connection():
+        try:
+            return mysql.connector.connect(
+                host=os.getenv('DB_HOST'),
+                user=os.getenv('DB_USER'),
+                password=os.getenv('DB_PASSWORD'),
+                database=os.getenv('DB_NAME_PRICES')
+            )
+        except Exception as e:
+            logger.error(f'Database connection error: {e}')
+            return None
+    
+    def get_market_data(symbol: str, hours: int = 24) -> pd.DataFrame:
+        """Get recent market data for a symbol"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return pd.DataFrame()
+            
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT timestamp, price, volume
+                FROM crypto_prices 
+                WHERE symbol = %s 
+                AND timestamp >= DATE_SUB(NOW(), INTERVAL %s HOUR)
+                ORDER BY timestamp ASC
+            ''', (symbol, hours))
+            
+            data = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            if not data:
+                return pd.DataFrame()
+            
+            df = pd.DataFrame(data, columns=['timestamp', 'price', 'volume'])
+            df['price'] = pd.to_numeric(df['price'])
+            df['volume'] = pd.to_numeric(df['volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f'Error getting market data for {symbol}: {e}')
+            return pd.DataFrame()
+    
+    def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate technical indicators"""
+        try:
+            if df.empty or len(df) < 20:
+                return df
+            
+            # Moving averages
+            df['sma_20'] = df['price'].rolling(window=20).mean()
+            df['sma_50'] = df['price'].rolling(window=50).mean()
+            df['ema_12'] = df['price'].ewm(span=12).mean()
+            df['ema_26'] = df['price'].ewm(span=26).mean()
+            
+            # MACD
+            df['macd'] = df['ema_12'] - df['ema_26']
+            df['macd_signal'] = df['macd'].ewm(span=9).mean()
+            df['macd_histogram'] = df['macd'] - df['macd_signal']
+            
+            # RSI
+            delta = df['price'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            df['rsi'] = 100 - (100 / (1 + rs))
+            
+            # Bollinger Bands
+            df['bb_middle'] = df['price'].rolling(window=20).mean()
+            bb_std = df['price'].rolling(window=20).std()
+            df['bb_upper'] = df['bb_middle'] + (bb_std * 2)
+            df['bb_lower'] = df['bb_middle'] - (bb_std * 2)
+            df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+            
+            # Volume indicators
+            df['volume_sma'] = df['volume'].rolling(window=20).mean()
+            df['volume_ratio'] = df['volume'] / df['volume_sma']
+            
+            # Price momentum
+            df['momentum_5'] = df['price'].pct_change(5)
+            df['momentum_10'] = df['price'].pct_change(10)
+            df['momentum_20'] = df['price'].pct_change(20)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f'Error calculating technical indicators: {e}')
+            return df
+    
+    def detect_market_regime(df: pd.DataFrame) -> MarketRegime:
+        """Detect current market regime"""
+        try:
+            if df.empty or len(df) < 50:
+                return MarketRegime.SIDEWAYS
+            
+            # Calculate trend strength
+            sma_20 = df['sma_20'].iloc[-1] if 'sma_20' in df.columns else df['price'].iloc[-1]
+            sma_50 = df['sma_50'].iloc[-1] if 'sma_50' in df.columns else df['price'].iloc[-1]
+            
+            # Calculate volatility
+            volatility = df['price'].pct_change().std() * np.sqrt(24)  # Daily volatility
+            
+            # Calculate trend direction
+            price_change_20 = (df['price'].iloc[-1] - df['price'].iloc[-20]) / df['price'].iloc[-20]
+            
+            # Determine regime
+            if price_change_20 > 0.1 and sma_20 > sma_50:  # Strong uptrend
+                return MarketRegime.BULL
+            elif price_change_20 < -0.1 and sma_20 < sma_50:  # Strong downtrend
+                return MarketRegime.BEAR
+            else:
+                return MarketRegime.SIDEWAYS
+                
+        except Exception as e:
+            logger.error(f'Error detecting market regime: {e}')
+            return MarketRegime.SIDEWAYS
+    
+    def momentum_strategy(df: pd.DataFrame, symbol: str) -> List[TradingSignal]:
+        """Momentum trading strategy"""
+        signals = []
+        
+        try:
+            if df.empty or len(df) < 50:
+                return signals
+            
+            current_price = df['price'].iloc[-1]
+            sma_20 = df['sma_20'].iloc[-1]
+            sma_50 = df['sma_50'].iloc[-1]
+            rsi = df['rsi'].iloc[-1]
+            macd = df['macd'].iloc[-1]
+            macd_signal = df['macd_signal'].iloc[-1]
+            
+            # Momentum buy signal
+            if (sma_20 > sma_50 and 
+                current_price > sma_20 and 
+                rsi < 70 and 
+                macd > macd_signal and 
+                df['momentum_5'].iloc[-1] > 0.02):
+                
+                confidence = min(0.9, 0.6 + (rsi - 30) / 40 * 0.3)
+                
+                signals.append(TradingSignal(
+                    symbol=symbol,
+                    signal_type="BUY",
+                    confidence=confidence,
+                    strategy="momentum",
+                    reasoning=f"Momentum buy: Price above SMA20, RSI {rsi:.1f}, MACD bullish, 5-day momentum {df['momentum_5'].iloc[-1]:.3f}",
+                    entry_price=current_price,
+                    stop_loss=current_price * 0.95,
+                    take_profit=current_price * 1.15,
+                    time_horizon="medium"
+                ))
+                
+                momentum_signals.labels(direction="buy").inc()
+            
+            # Momentum sell signal
+            elif (sma_20 < sma_50 and 
+                  current_price < sma_20 and 
+                  rsi > 30 and 
+                  macd < macd_signal and 
+                  df['momentum_5'].iloc[-1] < -0.02):
+                
+                confidence = min(0.9, 0.6 + (70 - rsi) / 40 * 0.3)
+                
+                signals.append(TradingSignal(
+                    symbol=symbol,
+                    signal_type="SELL",
+                    confidence=confidence,
+                    strategy="momentum",
+                    reasoning=f"Momentum sell: Price below SMA20, RSI {rsi:.1f}, MACD bearish, 5-day momentum {df['momentum_5'].iloc[-1]:.3f}",
+                    entry_price=current_price,
+                    stop_loss=current_price * 1.05,
+                    take_profit=current_price * 0.85,
+                    time_horizon="medium"
+                ))
+                
+                momentum_signals.labels(direction="sell").inc()
+            
+        except Exception as e:
+            logger.error(f'Error in momentum strategy for {symbol}: {e}')
+        
+        return signals
+    
+    def mean_reversion_strategy(df: pd.DataFrame, symbol: str) -> List[TradingSignal]:
+        """Mean reversion trading strategy"""
+        signals = []
+        
+        try:
+            if df.empty or len(df) < 50:
+                return signals
+            
+            current_price = df['price'].iloc[-1]
+            bb_upper = df['bb_upper'].iloc[-1]
+            bb_lower = df['bb_lower'].iloc[-1]
+            bb_middle = df['bb_middle'].iloc[-1]
+            rsi = df['rsi'].iloc[-1]
+            
+            # Mean reversion buy signal (oversold)
+            if (current_price <= bb_lower and 
+                rsi < 30 and 
+                df['momentum_5'].iloc[-1] < -0.05):
+                
+                confidence = min(0.9, 0.7 + (30 - rsi) / 30 * 0.2)
+                
+                signals.append(TradingSignal(
+                    symbol=symbol,
+                    signal_type="BUY",
+                    confidence=confidence,
+                    strategy="mean_reversion",
+                    reasoning=f"Mean reversion buy: Price at lower BB, RSI {rsi:.1f} (oversold), strong negative momentum",
+                    entry_price=current_price,
+                    stop_loss=current_price * 0.92,
+                    take_profit=bb_middle,
+                    time_horizon="short"
+                ))
+                
+                mean_reversion_signals.labels(direction="buy").inc()
+            
+            # Mean reversion sell signal (overbought)
+            elif (current_price >= bb_upper and 
+                  rsi > 70 and 
+                  df['momentum_5'].iloc[-1] > 0.05):
+                
+                confidence = min(0.9, 0.7 + (rsi - 70) / 30 * 0.2)
+                
+                signals.append(TradingSignal(
+                    symbol=symbol,
+                    signal_type="SELL",
+                    confidence=confidence,
+                    strategy="mean_reversion",
+                    reasoning=f"Mean reversion sell: Price at upper BB, RSI {rsi:.1f} (overbought), strong positive momentum",
+                    entry_price=current_price,
+                    stop_loss=current_price * 1.08,
+                    take_profit=bb_middle,
+                    time_horizon="short"
+                ))
+                
+                mean_reversion_signals.labels(direction="sell").inc()
+            
+        except Exception as e:
+            logger.error(f'Error in mean reversion strategy for {symbol}: {e}')
+        
+        return signals
+    
+    def breakout_strategy(df: pd.DataFrame, symbol: str) -> List[TradingSignal]:
+        """Breakout trading strategy"""
+        signals = []
+        
+        try:
+            if df.empty or len(df) < 50:
+                return signals
+            
+            current_price = df['price'].iloc[-1]
+            bb_upper = df['bb_upper'].iloc[-1]
+            bb_lower = df['bb_lower'].iloc[-1]
+            volume_ratio = df['volume_ratio'].iloc[-1]
+            
+            # Breakout buy signal
+            if (current_price > bb_upper and 
+                volume_ratio > 1.5 and 
+                df['momentum_5'].iloc[-1] > 0.03):
+                
+                confidence = min(0.9, 0.6 + (volume_ratio - 1) * 0.2)
+                
+                signals.append(TradingSignal(
+                    symbol=symbol,
+                    signal_type="BUY",
+                    confidence=confidence,
+                    strategy="breakout",
+                    reasoning=f"Breakout buy: Price above upper BB with high volume ({volume_ratio:.1f}x), strong momentum",
+                    entry_price=current_price,
+                    stop_loss=bb_upper * 0.98,
+                    take_profit=current_price * 1.20,
+                    time_horizon="short"
+                ))
+            
+            # Breakdown sell signal
+            elif (current_price < bb_lower and 
+                  volume_ratio > 1.5 and 
+                  df['momentum_5'].iloc[-1] < -0.03):
+                
+                confidence = min(0.9, 0.6 + (volume_ratio - 1) * 0.2)
+                
+                signals.append(TradingSignal(
+                    symbol=symbol,
+                    signal_type="SELL",
+                    confidence=confidence,
+                    strategy="breakout",
+                    reasoning=f"Breakdown sell: Price below lower BB with high volume ({volume_ratio:.1f}x), strong negative momentum",
+                    entry_price=current_price,
+                    stop_loss=bb_lower * 1.02,
+                    take_profit=current_price * 0.80,
+                    time_horizon="short"
+                ))
+            
+        except Exception as e:
+            logger.error(f'Error in breakout strategy for {symbol}: {e}')
+        
+        return signals
+    
+    def generate_strategy_signals(symbols: List[str]) -> List[TradingSignal]:
+        """Generate trading signals using multiple strategies"""
+        all_signals = []
+        
+        for symbol in symbols:
+            try:
+                # Get market data
+                df = get_market_data(symbol, hours=72)  # 3 days of data
+                if df.empty:
+                    continue
+                
+                # Calculate technical indicators
+                df = calculate_technical_indicators(df)
+                
+                # Detect market regime
+                regime = detect_market_regime(df)
+                market_regime_detected.set(0 if regime == MarketRegime.BEAR else 1 if regime == MarketRegime.SIDEWAYS else 2)
+                
+                # Generate signals based on market regime
+                if regime == MarketRegime.BULL:
+                    # In bull market, favor momentum and breakout strategies
+                    all_signals.extend(momentum_strategy(df, symbol))
+                    all_signals.extend(breakout_strategy(df, symbol))
+                elif regime == MarketRegime.BEAR:
+                    # In bear market, favor mean reversion and short momentum
+                    all_signals.extend(mean_reversion_strategy(df, symbol))
+                    all_signals.extend(momentum_strategy(df, symbol))
+                else:  # SIDEWAYS
+                    # In sideways market, favor mean reversion
+                    all_signals.extend(mean_reversion_strategy(df, symbol))
+                
+            except Exception as e:
+                logger.error(f'Error generating signals for {symbol}: {e}')
+        
+        return all_signals
+    
+    def save_signals_to_database(signals: List[TradingSignal]):
+        """Save generated signals to database"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return
+            
+            cursor = conn.cursor()
+            
+            for signal in signals:
+                cursor.execute('''
+                    INSERT INTO trading_signals (
+                        symbol, signal_type, confidence, threshold, regime, 
+                        xgboost_confidence, llm_reasoning, timestamp, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ''', (
+                    signal.symbol,
+                    signal.signal_type,
+                    signal.confidence,
+                    0.6,  # Default threshold
+                    signal.strategy,
+                    signal.confidence,
+                    f"{signal.strategy.upper()}: {signal.reasoning}"
+                ))
+                
+                # Update metrics
+                strategy_signals_generated.labels(
+                    strategy=signal.strategy,
+                    signal_type=signal.signal_type
+                ).inc()
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.info(f'Saved {len(signals)} strategy signals to database')
+            
+        except Exception as e:
+            logger.error(f'Error saving signals to database: {e}')
+    
+    def strategy_loop():
+        """Main strategy execution loop"""
+        symbols = ['BTC', 'ETH', 'ADA', 'DOT', 'LINK', 'SOL', 'MATIC', 'AVAX', 'ATOM', 'UNI']
+        
+        while True:
+            try:
+                logger.info('Running trading strategies...')
+                
+                # Generate signals
+                signals = generate_strategy_signals(symbols)
+                
+                # Save to database
+                if signals:
+                    save_signals_to_database(signals)
+                    logger.info(f'Generated {len(signals)} strategy signals')
+                else:
+                    logger.info('No strategy signals generated')
+                
+                # Wait 5 minutes before next cycle
+                time.sleep(300)
+                
+            except Exception as e:
+                logger.error(f'Error in strategy loop: {e}')
+                time.sleep(60)
+    
+    @app.get('/health')
+    async def health_check():
+        return {
+            'status': 'healthy',
+            'service': 'trading-strategies',
+            'strategies': [
+                'momentum',
+                'mean_reversion', 
+                'breakout',
+                'scalping',
+                'swing',
+                'arbitrage'
+            ]
+        }
+    
+    @app.get('/metrics')
+    async def metrics():
+        return Response(content=generate_latest(), media_type='text/plain')
+    
+    @app.post('/generate-signals')
+    async def generate_signals_endpoint(symbols: List[str] = None):
+        try:
+            if symbols is None:
+                symbols = ['BTC', 'ETH', 'ADA', 'DOT', 'LINK']
+            
+            signals = generate_strategy_signals(symbols)
+            
+            # Convert to dict for JSON response
+            signal_dicts = []
+            for signal in signals:
+                signal_dicts.append({
+                    'symbol': signal.symbol,
+                    'signal_type': signal.signal_type,
+                    'confidence': signal.confidence,
+                    'strategy': signal.strategy,
+                    'reasoning': signal.reasoning,
+                    'entry_price': signal.entry_price,
+                    'stop_loss': signal.stop_loss,
+                    'take_profit': signal.take_profit,
+                    'time_horizon': signal.time_horizon
+                })
+            
+            return {
+                'success': True,
+                'signals': signal_dicts,
+                'count': len(signal_dicts)
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get('/market-regime')
+    async def get_market_regime():
+        try:
+            # Get data for major symbols to determine overall market regime
+            major_symbols = ['BTC', 'ETH']
+            regimes = []
+            
+            for symbol in major_symbols:
+                df = get_market_data(symbol, hours=72)
+                if not df.empty:
+                    df = calculate_technical_indicators(df)
+                    regime = detect_market_regime(df)
+                    regimes.append(regime.value)
+            
+            # Determine overall market regime
+            if not regimes:
+                overall_regime = "unknown"
+            else:
+                # Use most common regime
+                overall_regime = max(set(regimes), key=regimes.count)
+            
+            return {
+                'overall_regime': overall_regime,
+                'individual_regimes': {symbol: regime for symbol, regime in zip(major_symbols, regimes)}
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    if __name__ == '__main__':
+        logger.info('🚀 Starting Trading Strategies Service')
+        
+        # Start strategy loop in background
+        import threading
+        strategy_thread = threading.Thread(target=strategy_loop, daemon=True)
+        strategy_thread.start()
+        
+        logger.info('✅ Trading strategies service ready')
+        uvicorn.run(app, host='0.0.0.0', port=8028)
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trading-strategies-service
+  namespace: crypto-trading
+  labels:
+    app: trading-strategies-service
+    component: trading-strategies
+    node-type: analytics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trading-strategies-service
+  template:
+    metadata:
+      labels:
+        app: trading-strategies-service
+        component: trading-strategies
+        node-type: analytics
+    spec:
+      nodeSelector:
+        node-name: cryptoai-risk-analytics
+      tolerations:
+      - key: analytics-infrastructure
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      containers:
+      - name: trading-strategies-service
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8028
+          name: http
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn requests mysql-connector-python pandas numpy scikit-learn prometheus_client
+          python /app/trading_strategies_service.py
+        envFrom:
+        - configMapRef:
+            name: crypto-trading-config
+        - configMapRef:
+            name: database-config
+        - secretRef:
+            name: database-secrets
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+      volumes:
+      - name: app-code
+        configMap:
+          name: trading-strategies-code
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-strategies-service
+  namespace: crypto-trading
+  labels:
+    app: trading-strategies-service
+    component: trading-strategies
+spec:
+  selector:
+    app: trading-strategies-service
+  ports:
+  - port: 8028
+    targetPort: 8028
+    protocol: TCP
+  type: ClusterIP
