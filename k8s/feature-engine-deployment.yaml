@@ -1,0 +1,326 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feature-engine
+  namespace: crypto-trading
+  labels:
+    app: feature-engine
+    component: data-collection
+    node-type: data-collection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: feature-engine
+  template:
+    metadata:
+      labels:
+        app: feature-engine
+        component: data-collection
+        node-type: data-collection
+    spec:
+      nodeSelector:
+        node-name: cryptoai-data-collection
+      tolerations:
+      - key: "data-platform"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      containers:
+      - name: feature-engine
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8026
+          name: http
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn mysql-connector-python numpy pandas scikit-learn prometheus-fastapi-instrumentator aiohttp
+          python -c "
+          import os
+          import sys
+          import json
+          import logging
+          import numpy as np
+          import pandas as pd
+          from typing import Dict, List, Optional, Any, Tuple
+          from datetime import datetime, timedelta
+          import asyncio
+          import aiohttp
+          from fastapi import FastAPI, HTTPException, Request
+          from fastapi.middleware.cors import CORSMiddleware
+          from fastapi.responses import JSONResponse
+          import uvicorn
+          from pydantic import BaseModel
+          import mysql.connector
+          from mysql.connector import pooling
+          
+          # Configure logging
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+          )
+          logger = logging.getLogger(__name__)
+          
+          app = FastAPI(title='Feature Engineering Service')
+          
+          # Add CORS middleware
+          app.add_middleware(
+              CORSMiddleware,
+              allow_origins=['*'],
+              allow_credentials=True,
+              allow_methods=['*'],
+              allow_headers=['*'],
+          )
+          
+          def get_db_connection():
+              try:
+                  return mysql.connector.connect(
+                      host=os.getenv('DB_HOST'),
+                      user=os.getenv('DB_USER'),
+                      password=os.getenv('DB_PASSWORD'),
+                      database=os.getenv('DB_NAME_PRICES')
+                  )
+              except Exception as e:
+                  logger.error(f'Database connection error: {e}')
+                  return None
+          
+          def engineer_features(symbol: str, raw_data: Dict[str, Any]) -> Dict[str, Any]:
+              '''Engineer comprehensive features from raw price data'''
+              try:
+                  # Convert raw data to DataFrame
+                  df = pd.DataFrame(raw_data)
+                  
+                  if df.empty:
+                      return {}
+                  
+                  # Ensure we have required columns
+                  required_cols = ['timestamp', 'price', 'volume']
+                  for col in required_cols:
+                      if col not in df.columns:
+                          logger.warning(f'Missing required column: {col}')
+                          return {}
+                  
+                  # Sort by timestamp
+                  df = df.sort_values('timestamp')
+                  
+                  # Basic price features
+                  features = {}
+                  features['price'] = float(df['price'].iloc[-1])
+                  features['volume'] = float(df['volume'].iloc[-1])
+                  
+                  # Price change features
+                  if len(df) > 1:
+                      features['price_change_1h'] = float((df['price'].iloc[-1] - df['price'].iloc[-2]) / df['price'].iloc[-2])
+                      features['price_change_4h'] = float((df['price'].iloc[-1] - df['price'].iloc[-5]) / df['price'].iloc[-5]) if len(df) > 5 else 0
+                      features['price_change_24h'] = float((df['price'].iloc[-1] - df['price'].iloc[-25]) / df['price'].iloc[-25]) if len(df) > 25 else 0
+                  
+                  # Moving averages
+                  if len(df) >= 5:
+                      features['ma_5'] = float(df['price'].rolling(5).mean().iloc[-1])
+                      features['ma_10'] = float(df['price'].rolling(10).mean().iloc[-1]) if len(df) >= 10 else features['ma_5']
+                      features['ma_20'] = float(df['price'].rolling(20).mean().iloc[-1]) if len(df) >= 20 else features['ma_10']
+                  
+                  # Volatility features
+                  if len(df) >= 10:
+                      returns = df['price'].pct_change().dropna()
+                      features['volatility_1h'] = float(returns.std())
+                      features['volatility_4h'] = float(returns.tail(4).std()) if len(returns) >= 4 else features['volatility_1h']
+                  
+                  # Volume features
+                  if len(df) >= 5:
+                      features['volume_ma_5'] = float(df['volume'].rolling(5).mean().iloc[-1])
+                      features['volume_ratio'] = float(df['volume'].iloc[-1] / features['volume_ma_5']) if features['volume_ma_5'] > 0 else 1
+                  
+                  # Technical indicators
+                  if len(df) >= 14:
+                      # RSI calculation
+                      delta = df['price'].diff()
+                      gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                      loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                      rs = gain / loss
+                      features['rsi'] = float(100 - (100 / (1 + rs.iloc[-1]))) if not pd.isna(rs.iloc[-1]) else 50
+                  
+                  # Add timestamp
+                  features['timestamp_iso'] = datetime.now().isoformat()
+                  features['symbol'] = symbol
+                  
+                  return features
+                  
+              except Exception as e:
+                  logger.error(f'Error engineering features: {e}')
+                  return {}
+          
+          def save_features_to_db(symbol: str, features: Dict[str, Any]):
+              '''Save engineered features to database'''
+              try:
+                  conn = get_db_connection()
+                  if not conn:
+                      return False
+                  
+                  cursor = conn.cursor()
+                  
+                  # Create table if it doesn't exist
+                  cursor.execute('''
+                      CREATE TABLE IF NOT EXISTS ml_features_materialized (
+                          id INT AUTO_INCREMENT PRIMARY KEY,
+                          symbol VARCHAR(10),
+                          timestamp_iso DATETIME,
+                          price DECIMAL(20,8),
+                          volume DECIMAL(20,8),
+                          price_change_1h DECIMAL(10,6),
+                          price_change_4h DECIMAL(10,6),
+                          price_change_24h DECIMAL(10,6),
+                          ma_5 DECIMAL(20,8),
+                          ma_10 DECIMAL(20,8),
+                          ma_20 DECIMAL(20,8),
+                          volatility_1h DECIMAL(10,6),
+                          volatility_4h DECIMAL(10,6),
+                          volume_ma_5 DECIMAL(20,8),
+                          volume_ratio DECIMAL(10,6),
+                          rsi DECIMAL(10,6),
+                          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                      )
+                  ''')
+                  
+                  # Insert features (using only existing columns)
+                  cursor.execute('''
+                      INSERT INTO ml_features_materialized 
+                      (symbol, price_date, price_hour, timestamp_iso, current_price, volume_24h, price_change_24h, rsi_14)
+                      VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                  ''', (
+                      features.get('symbol'),
+                      features.get('timestamp_iso', datetime.now().isoformat())[:10],  # Extract date part
+                      datetime.now().hour,  # Current hour
+                      features.get('timestamp_iso'),
+                      features.get('price'),
+                      features.get('volume'),
+                      features.get('price_change_24h', 0),
+                      features.get('rsi', 50)
+                  ))
+                  
+                  conn.commit()
+                  cursor.close()
+                  conn.close()
+                  
+                  logger.info(f'Features saved for {symbol}')
+                  return True
+                  
+              except Exception as e:
+                  logger.error(f'Error saving features: {e}')
+                  return False
+          
+          def collect_and_engineer_features():
+              '''Collect price data and engineer features for all symbols'''
+              symbols = ['BTC', 'ETH', 'LINK', 'ADA', 'DOT']
+              
+              for symbol in symbols:
+                  try:
+                      conn = get_db_connection()
+                      if not conn:
+                          continue
+                      
+                      cursor = conn.cursor()
+                      
+                      # Get recent price data (last 30 data points)
+                      cursor.execute('''
+                          SELECT timestamp_iso, current_price, volume_usd_24h
+                          FROM price_data_real 
+                          WHERE symbol = %s 
+                          ORDER BY timestamp_iso DESC 
+                          LIMIT 30
+                      ''', (symbol,))
+                      
+                      data = cursor.fetchall()
+                      cursor.close()
+                      conn.close()
+                      
+                      if data:
+                          # Convert to DataFrame format
+                          raw_data = {
+                              'timestamp': [row[0] for row in data],
+                              'price': [float(row[1]) for row in data],
+                              'volume': [float(row[2]) for row in data]
+                          }
+                          
+                          # Engineer features
+                          features = engineer_features(symbol, raw_data)
+                          
+                          if features:
+                              # Save to database
+                              save_features_to_db(symbol, features)
+                      
+                  except Exception as e:
+                      logger.error(f'Error processing {symbol}: {e}')
+          
+          @app.get('/health')
+          async def health_check():
+              return {'status': 'healthy', 'service': 'feature-engine'}
+          
+          @app.post('/engineer-features')
+          async def engineer_features_endpoint(request: Request):
+              try:
+                  data = await request.json()
+                  symbol = data.get('symbol', 'BTC')
+                  
+                  # For now, just collect and engineer features
+                  collect_and_engineer_features()
+                  
+                  return {'success': True, 'message': f'Features engineered for {symbol}'}
+              except Exception as e:
+                  logger.error(f'Error in engineer features endpoint: {e}')
+                  raise HTTPException(status_code=500, detail=str(e))
+          
+          def feature_engineering_loop():
+              '''Background loop to continuously engineer features'''
+              import time
+              while True:
+                  try:
+                      collect_and_engineer_features()
+                      time.sleep(300)  # Run every 5 minutes
+                  except Exception as e:
+                      logger.error(f'Error in feature engineering loop: {e}')
+                      time.sleep(60)
+          
+          if __name__ == '__main__':
+              logger.info('🚀 Starting Feature Engineering Service')
+              
+              # Start background feature engineering
+              import threading
+              feature_thread = threading.Thread(target=feature_engineering_loop, daemon=True)
+              feature_thread.start()
+              
+              logger.info('✅ Feature engineering service ready')
+              uvicorn.run(app, host='0.0.0.0', port=8026)
+          "
+        envFrom:
+        - configMapRef:
+            name: crypto-trading-config
+        - configMapRef:
+            name: database-config
+        - secretRef:
+            name: database-secrets
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: feature-engine
+  namespace: crypto-trading
+  labels:
+    app: feature-engine
+    component: data-collection
+spec:
+  selector:
+    app: feature-engine
+  ports:
+  - port: 8026
+    targetPort: 8026
+  type: ClusterIP

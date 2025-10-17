@@ -109,15 +109,31 @@ data:
                             logger.info(f"Found case-insensitive match: {acc.currency} for {symbol}")
                             break
                 
-                # If still no match, try common variations
+                # If still no match, try common variations and symbol mappings
                 if not account:
-                    symbol_variations = [
+                    # Symbol mapping for common variations
+                    symbol_mappings = {
+                        'ETH': ['ETH2', 'ETH'],  # ETH2 is staked Ethereum
+                        'BTC': ['BTC'],  # BTC should be available
+                        'DOT': ['DOT'],  # DOT should be available
+                        'LINK': ['LINK'],  # LINK should be available
+                        'ADA': ['ADA']   # ADA should be available
+                    }
+                    
+                    # Get variations for this symbol
+                    base_variations = [
                         symbol.upper(),
                         symbol.lower(),
                         symbol.replace('-USD', ''),
                         symbol.replace('-USD', '').upper(),
                         symbol.replace('-USD', '').lower()
                     ]
+                    
+                    # Add symbol mappings
+                    if symbol.upper() in symbol_mappings:
+                        base_variations.extend(symbol_mappings[symbol.upper()])
+                    
+                    symbol_variations = base_variations
                     
                     for variation in symbol_variations:
                         for acc in accounts.accounts:
@@ -129,23 +145,37 @@ data:
                             break
                 
                 if not account:
-                    return {"success": False, "error": f"No {symbol} account found. Available symbols: {available_symbols[:10]}"}
+                    error_msg = f"No {symbol} account found. Available symbols: {available_symbols[:10]}"
+                    logger.error(error_msg)
+                    return {"success": False, "error": error_msg}
                 
                 # Get available balance
+                logger.info(f"Processing {symbol} account: {account.currency}, balance type: {type(account.available_balance)}")
                 try:
                     if hasattr(account.available_balance, 'value'):
                         available_balance = float(account.available_balance.value)
+                        logger.info(f"Balance from .value: {available_balance}")
                     elif isinstance(account.available_balance, dict):
                         # If it's a dict, try to get the value
                         available_balance = float(account.available_balance.get('value', 0))
+                        logger.info(f"Balance from dict: {available_balance}")
                     else:
                         available_balance = float(account.available_balance)
+                        logger.info(f"Balance direct: {available_balance}")
                 except (ValueError, TypeError) as e:
-                    logger.error(f"Error parsing balance for {symbol}: {e}, balance type: {type(account.available_balance)}")
-                    return {"success": False, "error": f"Error parsing {symbol} balance"}
+                    logger.error(f"Error parsing balance for {symbol}: {e}, balance type: {type(account.available_balance)}, balance value: {account.available_balance}")
+                    return {"success": False, "error": f"Error parsing {symbol} balance: {str(e)}"}
+                
+                # Special handling for ETH2 (staked Ethereum) - not tradeable
+                if account.currency == 'ETH2':
+                    error_msg = f"ETH2 (staked Ethereum) is not tradeable on Coinbase Advanced Trade"
+                    logger.error(error_msg)
+                    return {"success": False, "error": error_msg}
                 
                 if available_balance <= 0:
-                    return {"success": False, "error": f"Insufficient {symbol} balance"}
+                    error_msg = f"Insufficient {symbol} balance (balance: {available_balance})"
+                    logger.error(error_msg)
+                    return {"success": False, "error": error_msg}
                 
                 # For sell orders, we need to specify base_size (crypto amount)
                 # Sell a small percentage of available balance

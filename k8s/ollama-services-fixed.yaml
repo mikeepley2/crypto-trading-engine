@@ -164,48 +164,227 @@ spec:
                   logger.error(f'Ollama connection error: {e}')
                   return False
           
+          def get_recent_trades(symbol, hours=24):
+              """Get recent trades for a symbol to check for duplicates and patterns"""
+              try:
+                  conn = get_db_connection()
+                  if not conn:
+                      return []
+                  
+                  cursor = conn.cursor()
+                  cursor.execute('''
+                      SELECT symbol, signal_type, amount_usd, confidence, created_at, execution_status
+                      FROM trade_recommendations 
+                      WHERE symbol = %s 
+                      AND created_at >= DATE_SUB(NOW(), INTERVAL %s HOUR)
+                      ORDER BY created_at DESC
+                  ''', (symbol, hours))
+                  
+                  trades = cursor.fetchall()
+                  cursor.close()
+                  conn.close()
+                  
+                  return [{
+                      'symbol': t[0],
+                      'signal_type': t[1], 
+                      'amount_usd': t[2],
+                      'confidence': t[3],
+                      'created_at': t[4],
+                      'execution_status': t[5]
+                  } for t in trades]
+                  
+              except Exception as e:
+                  logger.error(f'Error getting recent trades: {e}')
+                  return []
+          
+          def detect_rapid_flip_pattern(recent_trades, current_signal_type):
+              """Detect if we're rapidly flipping between buy/sell for same symbol"""
+              if len(recent_trades) < 2:
+                  return False
+              
+              # Check last 3 trades for rapid flipping
+              last_3_trades = recent_trades[:3]
+              signal_types = [t['signal_type'] for t in last_3_trades]
+              
+              # If we have alternating BUY/SELL patterns, flag as suspicious
+              if len(signal_types) >= 2:
+                  if signal_types[0] != signal_types[1] and signal_types[0] == current_signal_type:
+                      return True
+              
+              return False
+          
+          def get_last_trade_time(symbol, signal_type):
+              """Get the time of the last trade for this symbol and signal type"""
+              try:
+                  conn = get_db_connection()
+                  if not conn:
+                      return None
+                  
+                  cursor = conn.cursor()
+                  cursor.execute('''
+                      SELECT created_at FROM trade_recommendations 
+                      WHERE symbol = %s AND signal_type = %s 
+                      AND (execution_status = %s OR execution_status = %s)
+                      ORDER BY created_at DESC LIMIT 1
+                  ''', (symbol, signal_type, 'EXECUTED', 'PENDING'))
+                  
+                  result = cursor.fetchone()
+                  cursor.close()
+                  conn.close()
+                  
+                  return result[0] if result else None
+                  
+              except Exception as e:
+                  logger.error(f'Error getting last trade time: {e}')
+                  return None
+          
+          def call_ollama_llm(trade_context):
+              """Call actual Ollama LLM for intelligent trade validation"""
+              try:
+                  prompt = f"""
+                  Analyze this cryptocurrency trade recommendation:
+                  
+                  Symbol: {trade_context['symbol']}
+                  Action: {trade_context['signal_type']}
+                  Confidence: {trade_context['confidence']}
+                  
+                  Recent 24h trade history:
+                  {format_trade_history(trade_context['recent_trades'])}
+                  
+                  Market context:
+                  {trade_context.get('market_context', 'No additional context available')}
+                  
+                  Should we execute this trade? Consider:
+                  1. Is this a duplicate or redundant trade?
+                  2. Does the trade make sense given recent activity?
+                  3. Are we buying after just selling (or vice versa)?
+                  4. What's the profit potential vs. risk?
+                  
+                  Respond with: APPROVE or REJECT and brief reasoning.
+                  """
+                  
+                  response = requests.post('http://ollama-server:11434/api/generate', 
+                      json={
+                          'model': 'llama3.2:3b', 
+                          'prompt': prompt,
+                          'stream': False
+                      },
+                      timeout=30)
+                  
+                  if response.status_code == 200:
+                      result = response.json()
+                      llm_response = result.get('response', '').strip()
+                      
+                      # Parse LLM response
+                      if 'APPROVE' in llm_response.upper():
+                          return {
+                              'validated': True,
+                              'confidence': trade_context['confidence'] * 0.9,
+                              'reasoning': f'LLM approved: {llm_response}',
+                              'risk_assessment': 'low'
+                          }
+                      else:
+                          return {
+                              'validated': False,
+                              'confidence': trade_context['confidence'] * 0.6,
+                              'reasoning': f'LLM rejected: {llm_response}',
+                              'risk_assessment': 'high'
+                          }
+                  else:
+                      logger.warning(f'Ollama API error: {response.status_code}')
+                      return None
+                      
+              except Exception as e:
+                  logger.error(f'Error calling Ollama LLM: {e}')
+                  return None
+          
+          def format_trade_history(trades):
+              """Format trade history for LLM prompt"""
+              if not trades:
+                  return "No recent trades"
+              
+              formatted = []
+              for trade in trades[:5]:  # Show last 5 trades
+                  formatted.append(f"- {trade['created_at']}: {trade['signal_type']} {trade['symbol']} ${trade['amount_usd']} (confidence: {trade['confidence']:.2f})")
+              
+              return "\\n".join(formatted)
+          
           def validate_trade_with_llm(recommendation):
               try:
-                  # Check if Ollama is available
-                  if not get_ollama_connection():
-                      logger.warning('Ollama server not available, skipping LLM validation')
-                      return {
-                          'validated': False,
-                          'confidence': 0.5,
-                          'reasoning': 'LLM service unavailable',
-                          'risk_assessment': 'medium'
-                      }
-                  
-                  # For now, implement a simple validation logic
-                  # In a real implementation, this would call the LLM model
                   symbol = recommendation['symbol']
                   signal_type = recommendation['signal_type']
                   confidence = recommendation['confidence']
                   
-                  # Simple validation rules
-                  if confidence > 0.8:
-                      validation_result = {
-                          'validated': True,
-                          'confidence': confidence * 0.9,  # Slightly reduce confidence
-                          'reasoning': f'High confidence {signal_type} signal for {symbol} validated by LLM',
-                          'risk_assessment': 'low'
-                      }
-                  elif confidence > 0.6:
-                      validation_result = {
-                          'validated': True,
-                          'confidence': confidence * 0.8,
-                          'reasoning': f'Medium confidence {signal_type} signal for {symbol} validated by LLM',
-                          'risk_assessment': 'medium'
-                      }
-                  else:
-                      validation_result = {
+                  # 1. Check recent trade history
+                  recent_trades = get_recent_trades(symbol, hours=24)
+                  
+                  # 2. Cooldown enforcement (1 hour minimum)
+                  last_trade_time = get_last_trade_time(symbol, signal_type)
+                  if last_trade_time:
+                      time_diff = datetime.now() - last_trade_time
+                      if time_diff.total_seconds() < 3600:  # 1 hour
+                          minutes_ago = int(time_diff.total_seconds() / 60)
+                          return {
+                              'validated': False,
+                              'confidence': confidence * 0.3,
+                              'reasoning': f'Cooldown period - last {signal_type} trade was {minutes_ago} minutes ago',
+                              'risk_assessment': 'high'
+                          }
+                  
+                  # 3. Pattern detection
+                  if detect_rapid_flip_pattern(recent_trades, signal_type):
+                      return {
                           'validated': False,
-                          'confidence': confidence * 0.6,
-                          'reasoning': f'Low confidence {signal_type} signal for {symbol} rejected by LLM',
+                          'confidence': confidence * 0.2,
+                          'reasoning': 'Suspicious rapid buy-sell pattern detected - avoiding flip trading',
+                          'risk_assessment': 'high'
+                          }
+                  
+                  # 4. Check for too many recent trades (max 4 per day per symbol)
+                  if len(recent_trades) >= 4:
+                      return {
+                          'validated': False,
+                          'confidence': confidence * 0.4,
+                          'reasoning': f'Too many recent trades ({len(recent_trades)}) for {symbol} - daily limit reached',
                           'risk_assessment': 'high'
                       }
                   
-                  return validation_result
+                  # 5. Call actual Ollama LLM if available
+                  if get_ollama_connection():
+                      trade_context = {
+                          'symbol': symbol,
+                          'signal_type': signal_type,
+                          'confidence': confidence,
+                          'recent_trades': recent_trades,
+                          'market_context': f'Current confidence: {confidence:.2f}'
+                      }
+                      
+                      llm_result = call_ollama_llm(trade_context)
+                      if llm_result:
+                          return llm_result
+                  
+                  # 6. Fallback to enhanced rule-based validation
+                  if confidence > 0.8 and len(recent_trades) < 2:
+                      return {
+                          'validated': True,
+                          'confidence': confidence * 0.9,
+                          'reasoning': f'High confidence {signal_type} signal for {symbol} - no recent conflicts',
+                          'risk_assessment': 'low'
+                      }
+                  elif confidence > 0.7 and len(recent_trades) < 3:
+                      return {
+                          'validated': True,
+                          'confidence': confidence * 0.8,
+                          'reasoning': f'Good confidence {signal_type} signal for {symbol} - limited recent activity',
+                          'risk_assessment': 'medium'
+                      }
+                  else:
+                      return {
+                          'validated': False,
+                          'confidence': confidence * 0.6,
+                          'reasoning': f'Insufficient confidence or too much recent activity for {signal_type} {symbol}',
+                          'risk_assessment': 'high'
+                      }
                   
               except Exception as e:
                   logger.error(f'LLM validation error: {e}')

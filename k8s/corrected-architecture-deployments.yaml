@@ -35,6 +35,11 @@ spec:
     spec:
       nodeSelector:
         node-name: cryptoai-data-collection
+      tolerations:
+      - key: "data-platform"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
       containers:
       - name: health-monitor
         image: python:3.11-slim
@@ -667,7 +672,12 @@ spec:
         node-type: analytics-monitoring
     spec:
       nodeSelector:
-        node-name: cryptoai-analytics-monitoring
+        node-name: cryptoai-risk-analytics
+      tolerations:
+      - key: "analytics-infrastructure"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
       containers:
       - name: simple-node-viewer
         image: python:3.11-slim

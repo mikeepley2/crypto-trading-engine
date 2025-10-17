@@ -92,9 +92,100 @@ data:
             orchestration_errors.labels(error_type='recommendation_creation').inc()
             return False
     
+    def validate_with_llm(recommendation):
+        """Validate trade recommendation with LLM service"""
+        try:
+            llm_service_url = os.getenv('LLM_VALIDATION_SERVICE_URL', 'http://ollama-llm-validation:8050')
+            
+            # Convert Decimal objects to float for JSON serialization
+            serializable_recommendation = {}
+            for key, value in recommendation.items():
+                if hasattr(value, '__class__') and 'Decimal' in str(value.__class__):
+                    serializable_recommendation[key] = float(value)
+                else:
+                    serializable_recommendation[key] = value
+            
+            response = requests.post(
+                f'{llm_service_url}/validate-recommendation',
+                json=serializable_recommendation,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    validation = result.get('validation', {})
+                    logger.info(f'LLM validation result: {validation}')
+                    return validation
+                else:
+                    logger.error(f'LLM validation failed: {result}')
+                    return None
+            else:
+                logger.error(f'LLM validation HTTP error: {response.status_code} - {response.text}')
+                return None
+                
+        except Exception as e:
+            logger.error(f'LLM validation error: {e}')
+            return None
+
     def execute_trade_recommendation(recommendation):
         """Execute a trade recommendation"""
         try:
+            # First, validate with LLM
+            validation_result = validate_with_llm(recommendation)
+            
+            if not validation_result:
+                logger.warning(f'LLM validation failed for {recommendation["symbol"]} - skipping trade')
+                # Update recommendation status to FAILED due to LLM validation failure
+                conn = get_db_connection()
+                if conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        UPDATE trade_recommendations 
+                        SET execution_status = 'FAILED', 
+                            executed_at = NOW(),
+                            llm_validation = NULL,
+                            llm_confidence = NULL,
+                            llm_reasoning = 'LLM validation service unavailable',
+                            risk_assessment = 'high',
+                            validation_timestamp = NOW()
+                        WHERE id = %s
+                    ''', (recommendation['id'],))
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                return False
+            
+            if not validation_result.get('validated', False):
+                logger.warning(f'LLM validation rejected {recommendation["symbol"]}: {validation_result.get("reasoning", "No reason provided")}')
+                # Update recommendation status to REJECTED with LLM validation results
+                conn = get_db_connection()
+                if conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        UPDATE trade_recommendations 
+                        SET execution_status = 'REJECTED', 
+                            executed_at = NOW(),
+                            llm_validation = %s,
+                            llm_confidence = %s,
+                            llm_reasoning = %s,
+                            risk_assessment = %s,
+                            validation_timestamp = NOW()
+                        WHERE id = %s
+                    ''', (
+                        validation_result.get('validated', False),
+                        validation_result.get('confidence', 0.0),
+                        validation_result.get('reasoning', ''),
+                        validation_result.get('risk_assessment', ''),
+                        recommendation['id']
+                    ))
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                return False
+            
+            logger.info(f'LLM validation approved {recommendation["symbol"]}: {validation_result.get("reasoning", "No reason provided")}')
+            
             # Call real trade executor service
             trade_data = {
                 'symbol': recommendation['symbol'],
@@ -117,15 +208,27 @@ data:
                 result = response.json()
                 
                 if result.get('success'):
-                    # Update recommendation status to EXECUTED
+                    # Update recommendation status to EXECUTED with LLM validation results
                     conn = get_db_connection()
                     if conn:
                         cursor = conn.cursor()
                         cursor.execute('''
                             UPDATE trade_recommendations 
-                            SET execution_status = 'EXECUTED', executed_at = NOW()
+                            SET execution_status = 'EXECUTED', 
+                                executed_at = NOW(),
+                                llm_validation = %s,
+                                llm_confidence = %s,
+                                llm_reasoning = %s,
+                                risk_assessment = %s,
+                                validation_timestamp = NOW()
                             WHERE id = %s
-                        ''', (recommendation['id'],))
+                        ''', (
+                            validation_result.get('validated', False),
+                            validation_result.get('confidence', 0.0),
+                            validation_result.get('reasoning', ''),
+                            validation_result.get('risk_assessment', ''),
+                            recommendation['id']
+                        ))
                         conn.commit()
                         cursor.close()
                         conn.close()
@@ -138,15 +241,27 @@ data:
                     
                     return True
                 else:
-                    # Trade failed - update status to FAILED
+                    # Trade failed - update status to FAILED with LLM validation results
                     conn = get_db_connection()
                     if conn:
                         cursor = conn.cursor()
                         cursor.execute('''
                             UPDATE trade_recommendations 
-                            SET execution_status = 'FAILED', executed_at = NOW()
+                            SET execution_status = 'FAILED', 
+                                executed_at = NOW(),
+                                llm_validation = %s,
+                                llm_confidence = %s,
+                                llm_reasoning = %s,
+                                risk_assessment = %s,
+                                validation_timestamp = NOW()
                             WHERE id = %s
-                        ''', (recommendation['id'],))
+                        ''', (
+                            validation_result.get('validated', False),
+                            validation_result.get('confidence', 0.0),
+                            validation_result.get('reasoning', ''),
+                            validation_result.get('risk_assessment', ''),
+                            recommendation['id']
+                        ))
                         conn.commit()
                         cursor.close()
                         conn.close()
@@ -177,12 +292,13 @@ data:
             
             cursor = conn.cursor()
             
-            # Get recent signals that haven't been processed
+            # Get recent signals that haven't been processed (processed = 0)
             cursor.execute('''
                 SELECT id, symbol, signal_type, confidence, llm_reasoning, created_at
                 FROM trading_signals 
                 WHERE created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)
                 AND processed = 0
+                AND signal_type IN ('BUY', 'SELL')
                 ORDER BY created_at DESC
                 LIMIT 10
             ''')
@@ -220,8 +336,72 @@ data:
             logger.error(f'Error processing signals: {e}')
             orchestration_errors.labels(error_type='signal_processing').inc()
     
+    def check_for_duplicate_trades(symbol, signal_type, hours=1, exclude_id=None):
+        """Check for recent duplicate trades to prevent overtrading"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return True  # Assume duplicate if no connection
+            
+            cursor = conn.cursor()
+            
+            # Check for recent recommendations with same symbol and signal type
+            # Exclude the current recommendation if exclude_id is provided
+            if exclude_id:
+                cursor.execute('''
+                    SELECT COUNT(*) FROM trade_recommendations 
+                    WHERE symbol = %s AND signal_type = %s 
+                    AND created_at >= DATE_SUB(NOW(), INTERVAL %s HOUR)
+                    AND (execution_status = %s OR execution_status = %s)
+                    AND id != %s
+                ''', (symbol, signal_type, hours, 'PENDING', 'EXECUTED', exclude_id))
+            else:
+                cursor.execute('''
+                    SELECT COUNT(*) FROM trade_recommendations 
+                    WHERE symbol = %s AND signal_type = %s 
+                    AND created_at >= DATE_SUB(NOW(), INTERVAL %s HOUR)
+                    AND (execution_status = %s OR execution_status = %s)
+                ''', (symbol, signal_type, hours, 'PENDING', 'EXECUTED'))
+            
+            count = cursor.fetchone()[0]
+            cursor.close()
+            conn.close()
+            
+            return count > 0
+            
+        except Exception as e:
+            logger.error(f'Error checking for duplicates: {e}')
+            return True  # Assume duplicate on error
+    
+    def check_daily_trade_limit(symbol, max_trades=4):
+        """Check if we've exceeded daily trade limit for a symbol"""
+        try:
+            conn = get_db_connection()
+            if not conn:
+                return True  # Assume limit reached if no connection
+            
+            cursor = conn.cursor()
+            
+            # Check trades in last 24 hours
+            cursor.execute('''
+                SELECT COUNT(*) FROM trade_recommendations 
+                WHERE symbol = %s 
+                AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                AND (execution_status = %s OR execution_status = %s)
+            ''', (symbol, 'PENDING', 'EXECUTED'))
+            
+            count = cursor.fetchone()[0]
+            cursor.close()
+            conn.close()
+            
+            return count >= max_trades
+            
+        except Exception as e:
+            logger.error(f'Error checking daily limit: {e}')
+            return True  # Assume limit reached on error
+    
     def process_pending_recommendations():
-        """Process pending trade recommendations"""
+        """Process pending trade recommendations with duplicate detection"""
         try:
             conn = get_db_connection()
             if not conn:
@@ -252,12 +432,37 @@ data:
                     'reasoning': rec[5]
                 }
                 
+                # Check for duplicate trades (1 hour cooldown)
+                if check_for_duplicate_trades(recommendation['symbol'], recommendation['signal_type'], hours=1, exclude_id=recommendation['id']):
+                    logger.warning(f'Skipping duplicate trade: {recommendation["symbol"]} {recommendation["signal_type"]} - recent trade exists')
+                    
+                    # Mark as duplicate and skip
+                    cursor.execute('''
+                        UPDATE trade_recommendations 
+                        SET execution_status = 'DUPLICATE', executed_at = NOW()
+                        WHERE id = %s
+                    ''', (recommendation['id'],))
+                    continue
+                
+                # Check daily trade limit (max 4 trades per symbol per day)
+                if check_daily_trade_limit(recommendation['symbol'], max_trades=4):
+                    logger.warning(f'Skipping trade: {recommendation["symbol"]} - daily limit reached')
+                    
+                    # Mark as limit exceeded and skip
+                    cursor.execute('''
+                        UPDATE trade_recommendations 
+                        SET execution_status = 'LIMIT_EXCEEDED', executed_at = NOW()
+                        WHERE id = %s
+                    ''', (recommendation['id'],))
+                    continue
+                
                 # Execute the trade
                 success = execute_trade_recommendation(recommendation)
                 
                 if success:
                     logger.info(f'Executed recommendation {rec[0]}: {rec[1]} {rec[2]}')
             
+            conn.commit()
             cursor.close()
             conn.close()
             
